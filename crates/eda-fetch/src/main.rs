@@ -1884,14 +1884,35 @@ async fn stats(root: &Path) -> Result<()> {
                     .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
                     .map(|m| m.asset_url)
                     .collect::<HashSet<_>>();
+            let manifest_hashes =
+                std::fs::read_to_string(root.join("manifests/texas-instruments.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
+                    .map(|m| m.sha256)
+                    .collect::<HashSet<_>>();
+            let object_hashes = walkdir::WalkDir::new(root.join("objects"))
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file() && entry.file_name() != ".gitkeep")
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.split('.').next())
+                        .map(str::to_owned)
+                })
+                .collect::<HashSet<_>>();
             println!(
-                "TI BXL catalog: observations={} unique_urls={}\nTI acquisition: complete_urls={} pending_or_failed={}\nRaw storage: unique_objects={} bytes={}",
+                "TI BXL catalog: observations={} unique_urls={}\nTI acquisition: complete_urls={} pending_or_failed={}\nRaw storage: objects={} bytes={}\nTI manifest objects={} orphan raw objects={}",
                 observations,
                 unique_urls,
                 manifest_urls.len(),
                 state.get("failures").and_then(|x| x.as_array()).map_or(0, Vec::len),
                 walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count(),
-                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum::<u64>()
+                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum::<u64>(),
+                manifest_hashes.len(),
+                object_hashes.difference(&manifest_hashes).count()
             );
         }
     }
