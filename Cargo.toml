@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/eda-model", "crates/eda-fetch", "crates/vendor/ti", "crates/vendor/analog-devices", "crates/bxl/model", "crates/bxl/parser", "crates/kicad", "crates/package-normalize", "crates/step-model", "crates/eda-convert", "crates/eda-validate"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "sync"] }
+url = "2"
+walkdir = "2"

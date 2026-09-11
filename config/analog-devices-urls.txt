@@ -1,0 +1,2 @@
+# Add one Analog Devices product-page URL per line.
+# The adapter parses only direct CAD links on these pages; it does not crawl analog.com.

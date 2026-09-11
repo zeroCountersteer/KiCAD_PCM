@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+
+# Local acquisition data: raw objects, append-only manifests, failures and
+# derived/generated libraries are reproducible but can be very large.
+/data/objects/*
+!/data/objects/.gitkeep
+/data/manifests/*.jsonl
+/data/failures/
+/data/derived/
+/data/generated/
+
+# Live catalog snapshots and crawler/download work state. Keep test fixtures in
+# crates/*/tests/fixtures/ under version control instead.
+/data/catalogs/*
+!/data/catalogs/.gitkeep
+
+# Long-running validation output
+/reports/runs/
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+/config/*.local
+/config/*secret*
+/config/*token*
+*.pem
+*.key
+
+# Editor/OS noise
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

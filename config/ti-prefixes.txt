@@ -1,0 +1,9 @@
+# Bounded, normal WEBENCH search prefixes. Add prefixes conservatively.
+TPS6
+LM3
+TLV
+OPA
+INA
+UCC
+DRV
+SN74

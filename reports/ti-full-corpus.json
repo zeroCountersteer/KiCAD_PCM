@@ -1,0 +1,22 @@
+{
+  "status": "incomplete",
+  "source": "ti-public-package-index",
+  "package_definitions": 2906,
+  "package_queries_processed": 2906,
+  "pending_package_queries": 0,
+  "transient_failures_remaining": 0,
+  "product_rows": 35574,
+  "bxl_capable_rows": 35574,
+  "unique_bxl_urls": 8566,
+  "step_capable_rows_metadata_only": 31026,
+  "catalog_finalized": true,
+  "bxl_observations_downloaded": 226,
+  "unique_bxl_objects": 99,
+  "unique_bxl_bytes": 12008661,
+  "converted_bxl_observations": 198,
+  "source_packages_converted": 105,
+  "unique_physical_geometries": 27,
+  "generated_footprints": 26,
+  "kicad_syntax_failures": 0,
+  "step_downloaded": false
+}
