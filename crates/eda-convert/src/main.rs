@@ -308,7 +308,7 @@ fn kicad_generate(
             let mut m = std::collections::BTreeMap::new();
             for p in &d.packages {
                 if let Some(g) = d.canonical.iter().find(|g| {
-                    g.fingerprints.physical_geometry_hash == p.fingerprints.physical_geometry_hash
+                    g.fingerprints.manufacturing_hash == p.fingerprints.manufacturing_hash
                 }) {
                     m.insert(
                         format!(
@@ -385,7 +385,7 @@ fn kicad_generate(
 fn dname(d: &package_normalize::DedupeResult, p: &package_normalize::NormalizedPackage) -> String {
     d.canonical
         .iter()
-        .find(|x| x.fingerprints.physical_geometry_hash == p.fingerprints.physical_geometry_hash)
+        .find(|x| x.fingerprints.manufacturing_hash == p.fingerprints.manufacturing_hash)
         .map(|x| safe(&x.preferred_name))
         .unwrap_or_else(|| safe(&p.source.name))
 }

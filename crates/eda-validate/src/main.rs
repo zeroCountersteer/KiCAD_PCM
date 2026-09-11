@@ -150,7 +150,7 @@ fn run_stage(
     models: bool,
     no3d: bool,
     clean: bool,
-    _resume: bool,
+    resume: bool,
     sample: bool,
 ) -> Result<()> {
     let root = data
@@ -196,6 +196,9 @@ fn run_stage(
     if models {
         fetch.push("--models-only");
     }
+    if resume {
+        fetch.push("--resume");
+    }
     fetch.push("--concurrency");
     fetch.push("2");
     stages.push(call(data, "acquisition", &fetch)?);
@@ -226,11 +229,9 @@ fn run_stage(
             k.push("--clean");
         }
         stages.push(call(data, "kicad-generate", &k)?);
-        stages.push(call(
-            data,
-            "kicad-check",
-            &["kicad-check", "data/generated/kicad"],
-        )?);
+        let kicad_root = data.join("generated/kicad");
+        let kicad_root = kicad_root.to_string_lossy().into_owned();
+        stages.push(call(data, "kicad-check", &["kicad-check", &kicad_root])?);
     }
     let env = Environment {
         os: std::env::consts::OS.into(),
@@ -311,11 +312,13 @@ fn call(data: &Path, name: &str, args: &[&str]) -> Result<Stage> {
     });
     let mut command = if Path::new(&bin).exists() {
         let mut c = Command::new(&bin);
+        c.arg("--data").arg(data);
         c.args(args);
         c
     } else {
         let mut c = Command::new("cargo");
         c.args(["run", "-q", "-p", exe, "--"]);
+        c.arg("--data").arg(data);
         c.args(args);
         c
     };

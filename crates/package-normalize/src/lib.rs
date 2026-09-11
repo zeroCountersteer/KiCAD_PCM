@@ -210,8 +210,9 @@ fn transformed(
     mut pads: Vec<NormalizedPad>,
     mut gs: Vec<NormalizedGraphic>,
     r: i32,
+    include_graphics: bool,
 ) -> (Vec<NormalizedPad>, Vec<NormalizedGraphic>, Bounds) {
-    let b = bounds(&pads, &gs);
+    let b = bounds(&pads, if include_graphics { &gs } else { &[] });
     let ox = (b.min_x_nm + b.max_x_nm) / 2;
     let oy = (b.min_y_nm + b.max_y_nm) / 2;
     for p in &mut pads {
@@ -235,7 +236,7 @@ fn transformed(
             xy[1] = y;
         }
     }
-    let b = bounds(&pads, &gs);
+    let b = bounds(&pads, if include_graphics { &gs } else { &[] });
     (pads, gs, b)
 }
 fn key(pads: &[NormalizedPad], gs: &[NormalizedGraphic], level: u8) -> String {
@@ -277,18 +278,29 @@ pub fn normalize_package(c: &EdaComponent, p: &Package) -> NormalizedPackage {
     let rawg = graphics(p);
     let mut best = None;
     for r in [0, 90000, 180000, 270000] {
-        let (a, b, bx) = transformed(raw.clone(), rawg.clone(), r);
+        let (a, b, bx) = transformed(raw.clone(), rawg.clone(), r, true);
         let k = key(&a, &b, 4);
         if best.as_ref().is_none_or(|x: &(String, _, _, _, _)| k < x.0) {
             best = Some((k, a, b, bx, r));
         }
     }
     let (_, pads, graphics, bounds, rotation_mdeg) = best.unwrap();
+    let fingerprint = |level: u8| {
+        let mut best = None;
+        for r in [0, 90000, 180000, 270000] {
+            let (p, g, _) = transformed(raw.clone(), rawg.clone(), r, level == 4);
+            let k = key(&p, &g, level);
+            if best.as_ref().is_none_or(|x: &(String, _, _)| k < x.0) {
+                best = Some((k, p, g));
+            }
+        }
+        best.unwrap().0
+    };
     let fingerprints = Fingerprints {
-        physical_geometry_hash: hash(&key(&pads, &graphics, 1)),
-        electrical_geometry_hash: hash(&key(&pads, &graphics, 2)),
-        manufacturing_hash: hash(&key(&pads, &graphics, 3)),
-        full_geometry_hash: hash(&key(&pads, &graphics, 4)),
+        physical_geometry_hash: hash(&fingerprint(1)),
+        electrical_geometry_hash: hash(&fingerprint(2)),
+        manufacturing_hash: hash(&fingerprint(3)),
+        full_geometry_hash: hash(&fingerprint(4)),
     };
     let mut warnings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -349,10 +361,12 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
         .iter()
         .flat_map(|c| c.packages.iter().map(|p| normalize_package(c, p)))
         .collect::<Vec<_>>();
+    // Physical groups are useful for analysis, but are not safe KiCad reuse
+    // identities: they intentionally omit numbering and manufacturing data.
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in &packages {
         groups
-            .entry(p.fingerprints.physical_geometry_hash.clone())
+            .entry(p.fingerprints.manufacturing_hash.clone())
             .or_default()
             .push(format!("{}:{}", p.source.mpn, p.source.name));
     }
@@ -361,7 +375,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
     for (h, names) in &groups {
         let ix = packages
             .iter()
-            .position(|p| p.fingerprints.physical_geometry_hash == *h)
+            .position(|p| p.fingerprints.manufacturing_hash == *h)
             .unwrap();
         let mut aliases = names.clone();
         aliases.sort();
@@ -371,7 +385,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
             aliases,
             sources: packages
                 .iter()
-                .filter(|p| p.fingerprints.physical_geometry_hash == *h)
+                .filter(|p| p.fingerprints.manufacturing_hash == *h)
                 .map(|p| p.source.clone())
                 .collect(),
             representative: packages[ix].clone(),

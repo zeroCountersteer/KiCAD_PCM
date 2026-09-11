@@ -5,6 +5,8 @@
 # derived/generated libraries are reproducible but can be very large.
 /data/objects/*
 !/data/objects/.gitkeep
+/data/acquisition/*
+/data/failures/*
 /data/manifests/*.jsonl
 /data/failures/
 /data/derived/

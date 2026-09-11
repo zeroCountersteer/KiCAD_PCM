@@ -77,6 +77,15 @@ pub fn validate(c: &EdaComponent) -> Validation {
                 v.errors
                     .push(format!("{}: duplicate pad {}", p.name, x.number))
             }
+            if !matches!(
+                x.shape.to_ascii_lowercase().as_str(),
+                "circle" | "oval" | "roundrect" | "rectangle" | "rect"
+            ) {
+                v.errors.push(format!(
+                    "{} pad {}: unsupported source shape {}",
+                    p.name, x.number, x.shape
+                ));
+            }
             for l in &x.layers {
                 if layer(l).is_none() {
                     v.warnings
@@ -206,11 +215,15 @@ pub fn footprint(_c: &EdaComponent, p: &Package) -> String {
     footprint_with_model(_c, p, None)
 }
 pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>) -> String {
+    let has_through_hole = p.pads.iter().any(|pad| pad.drill.is_some());
     let mut o = format!(
-        "(footprint \"{}\" (version {}) (generator pcbnew)\n  (layer \"F.Cu\")\n  (attr smd)\n",
+        "(footprint \"{}\" (version {}) (generator pcbnew)\n  (layer \"F.Cu\")\n",
         name(&p.name),
         KICAD_VERSION
     );
+    if !has_through_hole {
+        o.push_str("  (attr smd)\n");
+    }
     o.push_str(&format!("  (fp_text reference \"REF**\" (at 0 0 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{}\" (at 0 0 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))\n",esc(&p.name)));
     for g in &p.graphics {
         if let Graphic::Line {
@@ -235,21 +248,36 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         } else {
             "smd"
         };
-        let layers = if kind == "smd" {
+        let default_layers = if kind == "smd" {
             "\"F.Cu\" \"F.Paste\" \"F.Mask\""
         } else {
             "\"*.Cu\" \"*.Mask\""
+        };
+        let layers = if x.layers.is_empty() {
+            default_layers.to_string()
+        } else {
+            x.layers
+                .iter()
+                .map(|source| layer(source).unwrap_or(source.as_str()))
+                .map(|name| format!("\"{}\"", esc(name)))
+                .collect::<Vec<_>>()
+                .join(" ")
         };
         let shape = match x.shape.to_ascii_lowercase().as_str() {
             "circle" => "circle",
             "oval" => "oval",
             "roundrect" => "roundrect",
             "rectangle" => "rect",
-            _ => "rect",
+            _ => "custom",
         };
+        let drill = x
+            .drill
+            .as_ref()
+            .map(|d| format!(" (drill {})", mm(d.x_nm)))
+            .unwrap_or_default();
         let _ = writeln!(
             o,
-            "  (pad \"{}\" {} {} (at {} {} {}) (size {} {}) (layers {}))",
+            "  (pad \"{}\" {} {} (at {} {} {}) (size {} {}) (layers {}){})",
             esc(&x.number),
             kind,
             shape,
@@ -258,7 +286,8 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
             angle(x.rotation_mdeg),
             mm(x.size.x_nm),
             mm(x.size.y_nm),
-            layers
+            layers,
+            drill
         );
     }
     if let Some(path) = model {
@@ -310,5 +339,29 @@ mod tests {
     #[test]
     fn escaping() {
         assert_eq!(esc("a\"b"), "a\\\"b");
+    }
+    #[test]
+    fn through_hole_output_has_drill_and_no_smd_attribute() {
+        let package = Package {
+            name: "HDR".into(),
+            pads: vec![eda_model::Pad {
+                number: "1".into(),
+                shape: "circle".into(),
+                size: eda_model::Point {
+                    x_nm: 1_600_000,
+                    y_nm: 1_600_000,
+                },
+                drill: Some(eda_model::Point {
+                    x_nm: 800_000,
+                    y_nm: 800_000,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = footprint(&EdaComponent::default(), &package);
+        assert!(!out.contains("(attr smd)"));
+        assert!(out.contains("np_thru_hole") || out.contains("thru_hole"));
+        assert!(out.contains("(drill 0.8)"));
     }
 }

@@ -21,3 +21,11 @@ The sampled objects showed no confirmed BXL version tag, no confirmed embedded S
 ## Reusable implementation
 
 `cyrozap/bxl-rs` (crates.io `bxl` 0.1.0, repository `https://github.com/cyrozap/bxl-rs`) supplies the decompressor used by `crates/bxl/parser`. It is GPL-3.0-or-later, so the parser/converter crates are explicitly GPL-3.0-or-later and this dependency is not copied into the repository. Its API only decompresses BXL; all structural parsing and canonicalization here is project code. License compatibility should be reviewed before redistributing this workspace under another license.
+# Acquisition/canonicalization notes
+
+The parser preserves explicit `PinMap`/`PadNum` pairs when they occur in the
+decoded text stream.  These mappings are kept distinct from the displayed
+symbol pin number and are marked `explicit` in canonical `pin_map` records.
+`PatternName` and `AlternatePattern` observations are retained in component
+metadata.  PadStack drill values are retained when explicitly present; other
+layer-specific fields remain source-unknown until their grammar is confirmed.

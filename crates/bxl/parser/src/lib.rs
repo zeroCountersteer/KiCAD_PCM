@@ -58,6 +58,11 @@ pub fn canonicalize(
         Regex::new(r#"PadShape\s+"([^"]+)"\s+\(Width\s+([-0-9.]+)\)\s+\(Height\s+([-0-9.]+)\)"#)
             .unwrap();
     let mut stacks: BTreeMap<String, (String, i64, i64)> = BTreeMap::new();
+    let drill_re = Regex::new(r#"(?:Drill|DrillSize)\s+\(?\s*([-0-9.]+)"#).unwrap();
+    let mut stack_drills: BTreeMap<String, i64> = BTreeMap::new();
+    let pin_map_re = Regex::new(
+        r#"PinMap.*?(?:PinNum\s+\(?\s*([^\s\)]+)).*?PadNum\s+\(?\s*([^\s\)]+)|PinMap\s+([^\s\)]+)\s+([^\s\)]+)"#,
+    ).unwrap();
     let mut current = None;
     for line in text.lines() {
         if let Some(m) = ps.captures(line) {
@@ -91,7 +96,28 @@ pub fn canonicalize(
         ..Default::default()
     };
     let mut pending = None;
+    let mut explicit_maps: BTreeMap<String, String> = BTreeMap::new();
+    let mut patterns = Vec::new();
     for line in text.lines() {
+        if let Some(m) = drill_re.captures(line) {
+            if let Some(k) = current.clone() {
+                stack_drills.insert(k, mil_nm(&m[1]));
+            }
+        }
+        if let Some(m) = pin_map_re.captures(line) {
+            let pin = m.get(1).or_else(|| m.get(3)).map(|x| x.as_str());
+            let pad = m.get(2).or_else(|| m.get(4)).map(|x| x.as_str());
+            if let (Some(pin), Some(pad)) = (pin, pad) {
+                explicit_maps.insert(pin.trim_matches('"').into(), pad.trim_matches('"').into());
+            }
+        }
+        for key in ["PatternName", "AlternatePattern"] {
+            if line.contains(key) {
+                if let Some(value) = line.split('"').nth(1) {
+                    patterns.push(format!("{key}:{value}"));
+                }
+            }
+        }
         if let Some(m) = pat.captures(line) {
             if let Some(p) = package.take() {
                 c.packages.push(p)
@@ -125,6 +151,10 @@ pub fn canonicalize(
                         y_nm: mil_nm(&m[5]),
                     },
                     size: Point { x_nm: w, y_nm: h },
+                    drill: stack_drills
+                        .get(&m[3])
+                        .map(|d| Point { x_nm: *d, y_nm: *d }),
+                    plated: Some(!m[3].to_ascii_lowercase().contains("npth")),
                     ..Default::default()
                 })
             }
@@ -203,6 +233,12 @@ pub fn canonicalize(
         "source_units".into(),
         "mil (inferred from decoded TI corpus)".into(),
     );
+    if !patterns.is_empty() {
+        patterns.sort();
+        patterns.dedup();
+        c.metadata
+            .insert("pattern_relationships".into(), patterns.join(";"));
+    }
     for s in &c.symbols {
         for u in &s.units {
             for p in &u.pins {
@@ -216,10 +252,10 @@ pub fn canonicalize(
                     pin_name: p.name.clone(),
                     unit: 1,
                     symbol_pin_ref: Some(p.number.clone()),
-                    pad_ref: None,
+                    pad_ref: explicit_maps.get(&p.number).cloned(),
                     electrical_type_raw: p.source_semantics.electrical_type_raw.clone(),
                     flags: p.source_semantics.flags.clone(),
-                    explicit: false,
+                    explicit: explicit_maps.contains_key(&p.number),
                 });
             }
         }

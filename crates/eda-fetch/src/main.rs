@@ -8,12 +8,10 @@ use std::{
     collections::HashSet,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use tokio::{
     fs,
-    io::AsyncWriteExt,
-    sync::Semaphore,
+    io::{AsyncReadExt, AsyncWriteExt},
     time::{sleep, Duration},
 };
 
@@ -51,6 +49,8 @@ enum Command {
         all: bool,
         #[arg(long)]
         with_step: bool,
+        #[arg(long)]
+        max_assets: Option<usize>,
     },
     TiCatalog {
         #[command(subcommand)]
@@ -159,6 +159,8 @@ struct CadLookup {
     assets: Vec<AssetRecord>,
     lookup_at: String,
     source_fingerprint: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -176,6 +178,7 @@ async fn main() -> Result<()> {
             sample,
             all,
             with_step,
+            max_assets,
         } => {
             run(
                 "Texas Instruments",
@@ -205,6 +208,7 @@ async fn main() -> Result<()> {
                     load_catalog(&cli.data).ok()
                 },
                 with_step,
+                max_assets,
             )
             .await?
         }
@@ -226,6 +230,7 @@ async fn main() -> Result<()> {
                 false,
                 None,
                 false,
+                None,
             )
             .await?
         }
@@ -466,42 +471,71 @@ async fn refresh_ti_bxl_catalog(
             .send()
             .await;
         match result {
-            Ok(r) => match r.error_for_status() {
-                Ok(r) => {
-                    let body = r.text().await?;
-                    for mut row in vendor_ti::parse_products_by_package(
-                        &body,
-                        vendor_ti::PRODUCTS_BY_PACKAGE_URL,
-                    ) {
-                        row.package_pitch = p.pitch;
-                        row.package_height = p.max_height;
-                        row.package_length = p.length;
-                        row.package_width = p.width;
-                        let key = format!(
-                            "{}|{}|{}",
-                            row.part_number,
-                            row.package_code.as_deref().unwrap_or(""),
-                            row.pin_count.map_or_else(|| "".into(), |n| n.to_string())
-                        );
-                        work.products.insert(key, row);
+            Ok(r) => {
+                let status = r.status();
+                match r.error_for_status() {
+                    Ok(r) => {
+                        let body = r.text().await?;
+                        for mut row in vendor_ti::parse_products_by_package(
+                            &body,
+                            vendor_ti::PRODUCTS_BY_PACKAGE_URL,
+                        ) {
+                            row.package_pitch = p.pitch;
+                            row.package_height = p.max_height;
+                            row.package_length = p.length;
+                            row.package_width = p.width;
+                            let key = format!(
+                                "{}|{}|{}",
+                                row.part_number,
+                                row.package_code.as_deref().unwrap_or(""),
+                                row.pin_count.map_or_else(|| "".into(), |n| n.to_string())
+                            );
+                            work.products.insert(key, row);
+                        }
+                        work.query_status.insert(query_key, "Complete".into());
                     }
-                    work.query_status.insert(query_key, "Complete".into());
+                    Err(e) => {
+                        work.failures.push(format!(
+                            "{}: {} (packageDesignator={}&pinCount={})",
+                            p.package_code,
+                            e,
+                            p.package_code,
+                            p.pin_count.unwrap_or_default()
+                        ));
+                        work.query_status.insert(
+                            query_key,
+                            if transient_http(status) {
+                                "FailedTransient"
+                            } else {
+                                "FailedPermanent"
+                            }
+                            .into(),
+                        );
+                    }
                 }
-                Err(e) => {
-                    work.failures.push(format!("{}: {}", p.package_code, e));
-                    work.query_status
-                        .insert(query_key, "FailedPermanent".into());
-                }
-            },
+            }
             Err(e) => {
-                work.failures.push(format!("{}: {}", p.package_code, e));
+                work.failures.push(format!(
+                    "{}: {} (packageDesignator={}&pinCount={})",
+                    p.package_code,
+                    e,
+                    p.package_code,
+                    p.pin_count.unwrap_or_default()
+                ));
                 work.query_status
                     .insert(query_key, "FailedTransient".into());
             }
         }
         work.next += 1;
-        work.status = if work.next == work.packages.len() {
-            "complete".into()
+        work.status = if work.next == work.packages.len()
+            && !work.query_status.values().any(|s| s == "FailedTransient")
+        {
+            if work.failures.is_empty() {
+                "complete"
+            } else {
+                "complete_with_permanent_failures"
+            }
+            .into()
         } else {
             "incomplete".into()
         };
@@ -519,7 +553,9 @@ async fn refresh_ti_bxl_catalog(
             work.failures.len()
         );
     }
-    if work.next == work.packages.len() {
+    if work.next == work.packages.len()
+        && !work.query_status.values().any(|s| s == "FailedTransient")
+    {
         let values = work.products.values().collect::<Vec<_>>();
         let body = serde_json::to_string_pretty(&values)? + "\n";
         atomic_write(&dir.join("current.json"), &body).await?;
@@ -565,6 +601,11 @@ fn failure_class(failure: &str) -> &'static str {
     } else {
         "Other"
     }
+}
+fn transient_http(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
 }
 async fn retry_ti_bxl_failures(
     root: &Path,
@@ -1322,6 +1363,7 @@ async fn run(
     dump_discovery: bool,
     catalog: Option<Vec<vendor_ti::TiCatalogProduct>>,
     with_step: bool,
+    max_assets: Option<usize>,
 ) -> Result<()> {
     let mut assets = if let Some(products) = catalog {
         discover_catalog_cached(&products, root, with_step).await?
@@ -1353,6 +1395,29 @@ async fn run(
         true
     });
     let discovered_assets = assets.len();
+    // Keep the many-to-one source relationship separately from download jobs.
+    // A URL is downloaded once, but every product/package observation remains
+    // queryable for provenance and later canonicalization.
+    let mut references = std::collections::BTreeMap::<String, Vec<AssetRecord>>::new();
+    for asset in &assets {
+        references
+            .entry(asset.asset_url.clone())
+            .or_default()
+            .push(asset.clone());
+    }
+    let reference_jsonl = references
+        .values()
+        .map(|items| serde_json::to_string(items).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?
+        .join("\n")
+        + if references.is_empty() { "" } else { "\n" };
+    let acquisition_dir = root.join("acquisition");
+    fs::create_dir_all(&acquisition_dir).await?;
+    atomic_write(
+        &acquisition_dir.join(format!("{kind}-references.jsonl")),
+        &reference_jsonl,
+    )
+    .await?;
     assets.sort_by(|a, b| a.asset_url.cmp(&b.asset_url).then(a.mpn.cmp(&b.mpn)));
     assets.dedup_by(|a, b| a.asset_url == b.asset_url);
     println!(
@@ -1376,25 +1441,40 @@ async fn run(
         .timeout(Duration::from_secs(45))
         .build()?;
     let manifest_path = root.join("manifests").join(format!("{kind}.jsonl"));
-    let known: HashSet<String> = fs::read_to_string(&manifest_path)
+    let manifest_known: HashSet<String> = fs::read_to_string(&manifest_path)
         .await
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<ManifestRecord>(l).ok())
         .map(|m| m.asset_url)
         .collect();
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut tasks = Vec::new();
-    for asset in assets.into_iter().filter(|a| !known.contains(&a.asset_url)) {
-        let permit = sem.clone().acquire_owned().await?;
-        let c = client.clone();
-        let r = root.to_path_buf();
-        tasks.push(tokio::spawn(async move {
-            let x = download(&c, &r, &asset).await;
-            drop(permit);
-            (asset, x)
-        }));
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct AcquisitionState {
+        completed: std::collections::BTreeSet<String>,
+        in_progress: std::collections::BTreeSet<String>,
+        failures: std::collections::BTreeSet<String>,
     }
+    let state_path = root.join("acquisition").join(format!("{kind}.json"));
+    fs::create_dir_all(state_path.parent().unwrap()).await?;
+    let mut state: AcquisitionState = if _resume && fs::try_exists(&state_path).await? {
+        serde_json::from_str(&fs::read_to_string(&state_path).await?).unwrap_or_default()
+    } else {
+        AcquisitionState::default()
+    };
+    state.in_progress.clear();
+    let known: HashSet<String> = manifest_known
+        .into_iter()
+        .chain(state.completed.iter().cloned())
+        .collect();
+    let unique_urls = assets.len();
+    let mut pending = assets
+        .into_iter()
+        .filter(|a| !known.contains(&a.asset_url))
+        .collect::<Vec<_>>();
+    if let Some(n) = max_assets {
+        pending.truncate(n);
+    }
+    println!("TI BXL acquisition\nCatalog observations: {}\nUnique BXL URLs: {}\nAlready complete: {}\nPending: {}\nTransient failures: {}", discovered_assets, unique_urls, known.len(), pending.len(), state.failures.len());
     let mut manifest = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1402,22 +1482,41 @@ async fn run(
         .await?;
     let mut ok = 0;
     let mut fail = 0;
-    for task in tasks {
-        let (asset, result) = task.await?;
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut next = 0usize;
+    while next < pending.len() || !jobs.is_empty() {
+        while next < pending.len() && jobs.len() < concurrency.max(1) {
+            let asset = pending[next].clone();
+            next += 1;
+            state.in_progress.insert(asset.asset_url.clone());
+            let c = client.clone();
+            let r = root.to_path_buf();
+            jobs.spawn(async move {
+                let result = download(&c, &r, &asset).await;
+                (asset, result)
+            });
+        }
+        let Some(joined) = jobs.join_next().await else {
+            break;
+        };
+        let (asset, result) = joined?;
+        state.in_progress.remove(&asset.asset_url);
         match result {
             Ok(m) => {
                 manifest
                     .write_all(serde_json::to_string(&m)?.as_bytes())
                     .await?;
                 manifest.write_all(b"\n").await?;
+                state.completed.insert(asset.asset_url.clone());
                 ok += 1;
             }
             Err(e) => {
                 fail += 1;
+                let asset_url = asset.asset_url.clone();
                 let f = FailureRecord {
                     manufacturer: asset.manufacturer,
                     mpn: asset.mpn,
-                    url: asset.asset_url,
+                    url: asset_url.clone(),
                     stage: "download".into(),
                     http_status: e
                         .to_string()
@@ -1434,8 +1533,10 @@ async fn run(
                     .await?;
                 file.write_all(format!("{}\n", serde_json::to_string(&f)?).as_bytes())
                     .await?;
+                state.failures.insert(asset_url);
             }
         }
+        atomic_write(&state_path, &serde_json::to_string_pretty(&state)?).await?;
     }
     println!("Completed: {}; failures: {}", ok, fail);
     Ok(())
@@ -1522,9 +1623,15 @@ async fn discover_catalog_cached(
             out.extend(direct);
             continue;
         }
-        let assets = vendor_ti::discover_catalog_product(p)
-            .await
-            .unwrap_or_default();
+        let assets = match vendor_ti::discover_catalog_product(p).await {
+            Ok(assets) => assets,
+            Err(error) => {
+                eprintln!("TI CAD lookup transient failure for {generic}: {error}");
+                // A failed request is not evidence that the product has no CAD.
+                // Leave it uncached so a later resume retries it.
+                continue;
+            }
+        };
         let status = if assets.is_empty() { "NoCad" } else { "HasCad" };
         let entry = CadLookup {
             generic_product: generic.clone(),
@@ -1541,6 +1648,7 @@ async fn discover_catalog_cached(
                         .join("\n")
                 )
             ),
+            error: None,
         };
         cache.insert(generic, entry);
         out.extend(assets);
@@ -1632,14 +1740,26 @@ async fn download(client: &Client, root: &Path, asset: &AssetRecord) -> Result<M
         f.write_all(&chunk).await?;
     }
     f.flush().await?;
-    let bytes = fs::read(&tmp).await?;
-    validate_content(&filename, ct.as_deref(), &bytes)?;
+    let validation_bytes = if filename.to_ascii_lowercase().ends_with(".zip") {
+        fs::read(&tmp).await?
+    } else {
+        let mut check = fs::File::open(&tmp).await?;
+        let mut prefix = vec![0u8; 4096];
+        let n = check.read(&mut prefix).await?;
+        prefix.truncate(n);
+        prefix
+    };
+    if let Err(error) = validate_content(&filename, ct.as_deref(), &validation_bytes) {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(error);
+    }
     let hash = format!("{:x}", hasher.finalize());
-    let ext = filename.rsplit('.').next().unwrap_or("bin");
-    let object = root
-        .join("objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.{ext}"));
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("bin")
+        .to_ascii_lowercase();
+    let object = object_path(root, &hash, &ext);
     fs::create_dir_all(object.parent().unwrap()).await?;
     if fs::try_exists(&object).await? {
         fs::remove_file(&tmp).await?;
@@ -1665,6 +1785,13 @@ async fn download(client: &Client, root: &Path, asset: &AssetRecord) -> Result<M
         final_download_url: Some(final_url),
         content_disposition_filename: disposition,
     })
+}
+
+fn object_path(root: &Path, sha256: &str, format: &str) -> PathBuf {
+    let normalized = format.trim_start_matches('.').to_ascii_lowercase();
+    root.join("objects")
+        .join(&sha256[..2])
+        .join(format!("{sha256}.{normalized}"))
 }
 
 fn validate_content(filename: &str, content_type: Option<&str>, bytes: &[u8]) -> Result<()> {
@@ -1735,6 +1862,38 @@ async fn stats(root: &Path) -> Result<()> {
             bytes,
             formats
         );
+    }
+    let refs = root.join("acquisition/texas-instruments-references.jsonl");
+    let observations = std::fs::read_to_string(&refs)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Vec<AssetRecord>>(line).ok())
+        .map(|items| items.len())
+        .sum::<usize>();
+    let unique_urls = std::fs::read_to_string(&refs)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let state_path = root.join("acquisition/texas-instruments.json");
+    if let Ok(text) = std::fs::read_to_string(state_path) {
+        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
+            let manifest_urls =
+                std::fs::read_to_string(root.join("manifests/texas-instruments.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
+                    .map(|m| m.asset_url)
+                    .collect::<HashSet<_>>();
+            println!(
+                "TI BXL catalog: observations={} unique_urls={}\nTI acquisition: complete_urls={} pending_or_failed={}\nRaw storage: unique_objects={} bytes={}",
+                observations,
+                unique_urls,
+                manifest_urls.len(),
+                state.get("failures").and_then(|x| x.as_array()).map_or(0, Vec::len),
+                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count(),
+                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum::<u64>()
+            );
+        }
     }
     Ok(())
 }
