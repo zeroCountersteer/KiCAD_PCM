@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 #[derive(Parser)]
 struct Cli {
@@ -26,6 +27,8 @@ enum Command {
         all: bool,
     },
     BxlStats,
+    #[command(hide = true)]
+    BxlStatsWorker,
     Kicad {
         #[arg(long)]
         mpn: Option<String>,
@@ -96,6 +99,7 @@ fn main() -> Result<()> {
             }
         }
         Command::BxlStats => stats(&c.data),
+        Command::BxlStatsWorker => stats_worker(&c.data),
         Command::Kicad {
             mpn,
             manufacturer,
@@ -255,22 +259,114 @@ fn batch(data: &Path) -> Result<()> {
     println!("converted {done} BXL observations");
     Ok(())
 }
-fn stats(data: &Path) -> Result<()> {
-    let mut files = 0;
-    let mut parsed = 0;
-    let mut records = 0;
-    for e in walkdir::WalkDir::new(data.join("objects"))
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BxlStatsResult {
+    objects_processed: usize,
+    parsed_successfully: usize,
+    decompression_failures: usize,
+    utf8_failures: usize,
+    canonicalization_warnings: usize,
+    compressed_bytes: u64,
+    decoded_bytes: u64,
+}
+
+fn current_bxl_paths(data: &Path) -> Result<(Vec<PathBuf>, usize)> {
+    let current = data.join("catalogs/ti-bxl/current.json");
+    let rows: Vec<vendor_ti::TiPackageProduct> = if current.exists() {
+        serde_json::from_str(&fs::read_to_string(current)?)?
+    } else {
+        Vec::new()
+    };
+    let urls = rows
+        .iter()
+        .filter_map(|r| r.bxl_url.as_deref())
+        .filter(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Bxl)
+        .collect::<std::collections::HashSet<_>>();
+    let records = fs::read_to_string(data.join("manifests/texas-instruments.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
+        .filter(|m| m.format == "bxl" && urls.contains(m.asset_url.as_str()))
+        .collect::<Vec<_>>();
+    let mut paths = records
+        .iter()
+        .map(|m| {
+            data.join("objects")
+                .join(&m.sha256[..2])
+                .join(format!("{}.bxl", m.sha256))
+        })
+        .filter(|p| p.exists())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let historical = walkdir::WalkDir::new(data.join("objects"))
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "bxl"))
-    {
-        files += 1;
-        if let Ok(d) = bxl_parser::parse(&fs::read(e.path())?) {
-            parsed += 1;
-            records += d.records.len()
+        .count()
+        .saturating_sub(paths.len());
+    Ok((paths, historical))
+}
+
+fn stats(data: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("locate eda-convert executable")?;
+    let output = ProcessCommand::new(exe)
+        .arg("--data")
+        .arg(data)
+        .arg("bxl-stats-worker")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("run quiet BXL statistics worker")?;
+    if !output.status.success() {
+        anyhow::bail!("BXL statistics worker failed with {}", output.status);
+    }
+    let result: BxlStatsResult = serde_json::from_slice(&output.stdout)?;
+    let (_, historical) = current_bxl_paths(data)?;
+    println!(
+        "BXL corpus\n\nCurrent-corpus BXL objects       {}\nHistorical BXL objects            {}\nObjects processed                 {}\nParsed successfully               {}\nDecompression failures            {}\nUTF-8 failures                    {}\nCanonicalization warnings         {}\n\nCompressed bytes                  {}\nDecoded bytes                     {}",
+        result.objects_processed,
+        historical,
+        result.objects_processed,
+        result.parsed_successfully,
+        result.decompression_failures,
+        result.utf8_failures,
+        result.canonicalization_warnings,
+        result.compressed_bytes,
+        result.decoded_bytes
+    );
+    Ok(())
+}
+
+fn stats_worker(data: &Path) -> Result<()> {
+    let (paths, _) = current_bxl_paths(data)?;
+    let mut result = BxlStatsResult::default();
+    for path in paths {
+        result.objects_processed += 1;
+        let bytes = fs::read(&path)?;
+        result.compressed_bytes += bytes.len() as u64;
+        match bxl_parser::parse(&bytes) {
+            Ok(doc) => {
+                result.parsed_successfully += 1;
+                let component =
+                    bxl_parser::canonicalize(&doc, "Texas Instruments", "<stats>", None);
+                result.canonicalization_warnings += component.warnings.len();
+                if let Some(text) = doc.raw_text {
+                    result.decoded_bytes += text.len() as u64;
+                } else {
+                    result.utf8_failures += 1;
+                }
+            }
+            Err(error) => {
+                if error.to_string().contains("UTF-8") {
+                    result.utf8_failures += 1;
+                } else {
+                    result.decompression_failures += 1;
+                }
+            }
         }
     }
-    println!("BXL objects                    {files}\nParsed successfully            {parsed}\nFailed                           {}\nRaw records                    {records}",files-parsed);
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]

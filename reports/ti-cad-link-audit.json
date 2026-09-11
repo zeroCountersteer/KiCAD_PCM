@@ -1,0 +1,14 @@
+{
+  "product_rows": 35574,
+  "rows_with_bxl_url": 25905,
+  "rows_with_step_url": 31026,
+  "correct_bxl_urls": 25905,
+  "correct_step_urls": 31026,
+  "bxl_url_classified_step": 0,
+  "step_url_classified_bxl": 0,
+  "unknown_cad_urls": 0,
+  "same_url_bxl_and_step": 0,
+  "unique_correct_bxl_urls": 7859,
+  "unique_correct_step_urls": 1117,
+  "suspicious": []
+}

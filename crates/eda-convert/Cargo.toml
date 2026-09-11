@@ -10,6 +10,7 @@ bxl-model={path="../bxl/model"}
 kicad={path="../kicad"}
 package-normalize={path="../package-normalize"}
 step-model={path="../step-model"}
+vendor-ti={path="../vendor/ti"}
 clap={workspace=true,features=["derive"]}
 eda-model={path="../eda-model"}
 serde.workspace=true

@@ -13,6 +13,49 @@ pub const PUBLIC_OVERVIEW_URL: &str = "https://www.ti.com/product-category/overv
 pub const PACKAGE_INDEX_URL: &str = "https://www.ti.com/packaging/docs/searchalltipackages.tsp";
 pub const PRODUCTS_BY_PACKAGE_URL: &str =
     "https://www.ti.com/packaging/docs/searchproductbypackage.tsp";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CadAssetKind {
+    Bxl,
+    Step,
+    Zip,
+    Unknown,
+}
+
+/// Classify only the asset filename.  CGI endpoint names such as `dlbxl.cgi`
+/// and `newstep` are intentionally ignored.
+pub fn classify_cad_url(value: &str) -> CadAssetKind {
+    let filename = Url::parse(value)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find_map(|(key, value)| {
+                    (key.eq_ignore_ascii_case("filename") || key.eq_ignore_ascii_case("file"))
+                        .then(|| value.into_owned())
+                })
+                .or_else(|| {
+                    url.path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .map(str::to_owned)
+                })
+        })
+        .or_else(|| {
+            let path = value.split('?').next()?.split('#').next()?;
+            path.rsplit('/').next().map(str::to_owned)
+        });
+    match filename
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .rsplit('.')
+        .next()
+    {
+        Some("bxl") => CadAssetKind::Bxl,
+        Some("stp") | Some("step") => CadAssetKind::Step,
+        Some("zip") => CadAssetKind::Zip,
+        _ => CadAssetKind::Unknown,
+    }
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct TiCatalogProduct {
     pub ti_part_number: String,
@@ -224,14 +267,11 @@ pub fn parse_products_by_package(body: &str, source: &str) -> Vec<TiPackageProdu
         }
         let bxl_url = links
             .iter()
-            .find(|x| x.to_ascii_lowercase().contains("bxl"))
+            .find(|x| classify_cad_url(x) == CadAssetKind::Bxl)
             .cloned();
         let step_url = links
             .iter()
-            .find(|x| {
-                let x = x.to_ascii_lowercase();
-                x.contains("step") || x.contains("stp")
-            })
+            .find(|x| classify_cad_url(x) == CadAssetKind::Step)
             .cloned();
         let bxl_available = bxl_url.is_some().then_some(true).or_else(|| {
             cells.iter().find_map(|x| {
@@ -953,6 +993,25 @@ mod tests {
         assert!(y.iter().any(|a| a.format == "stp"), "{y:?}");
     }
     #[test]
+    fn classifies_ti_cad_urls_by_filename_only() {
+        assert_eq!(
+            classify_cad_url("https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/FOO.bxl"),
+            CadAssetKind::Bxl
+        );
+        assert_eq!(
+            classify_cad_url("https://webench.ti.com/cad/dlbxl.cgi/newstep/D0014A.stp"),
+            CadAssetKind::Step
+        );
+        assert_eq!(
+            classify_cad_url("https://example.test/download?filename=FOO.STEP"),
+            CadAssetKind::Step
+        );
+        assert_eq!(
+            classify_cad_url("https://example.test/dlbxl.cgi/unknown"),
+            CadAssetKind::Unknown
+        );
+    }
+    #[test]
     fn parses_dynamic_package_index_data() {
         let html = r#"<script>var json_parsed={"list":[{"dgn":"DGG","pType":"Plastic Small Outline","pnC":"48","pit":"0.5","hgt":"1.2","BL":"12.5","BW":"6.1"}]};</script>"#;
         let packages = parse_package_index(html, "fixture");
@@ -979,7 +1038,27 @@ mod tests {
         assert_eq!(rows[0].pin_count, Some(48));
         assert_eq!(rows[0].bxl_available, Some(true));
         assert_eq!(rows[0].step_available, Some(true));
+        assert!(rows[0]
+            .bxl_url
+            .as_deref()
+            .is_some_and(|url| classify_cad_url(url) == CadAssetKind::Bxl));
+        assert!(rows[0]
+            .step_url
+            .as_deref()
+            .is_some_and(|url| classify_cad_url(url) == CadAssetKind::Step));
         assert_eq!(rows[1].bxl_available, None);
+    }
+    #[test]
+    fn step_only_row_never_becomes_bxl() {
+        let html = r#"<table><tr><td>ONLYSTEP</td><td>d</td><td>f</td><td>N</td><td>ACTIVE</td><td>D14|14</td>
+            <td><a href="https://webench.ti.com/cad/dlbxl.cgi/newstep/D0014A.stp">model</a></td></tr></table>"#;
+        let rows = parse_products_by_package(html, "fixture");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bxl_url, None);
+        assert_eq!(
+            rows[0].step_url.as_deref(),
+            Some("https://webench.ti.com/cad/dlbxl.cgi/newstep/D0014A.stp")
+        );
     }
     #[test]
     fn parses_and_merges_public_listing_products() {

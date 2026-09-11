@@ -147,6 +147,11 @@ enum TiBxlCatalogCommand {
         #[arg(long)]
         verbose: bool,
     },
+    AuditLinks,
+    RepairLinks {
+        #[arg(long)]
+        max_queries: Option<usize>,
+    },
     Inspect {
         package: String,
         pin_count: u32,
@@ -295,6 +300,10 @@ async fn main() -> Result<()> {
             TiBxlCatalogCommand::Failures { verbose } => {
                 ti_bxl_catalog_failures(&cli.data, verbose)?
             }
+            TiBxlCatalogCommand::AuditLinks => audit_ti_cad_links(&cli.data)?,
+            TiBxlCatalogCommand::RepairLinks { max_queries } => {
+                repair_ti_cad_links(&cli.data, max_queries).await?
+            }
             TiBxlCatalogCommand::Inspect { package, pin_count } => println!(
                 "TI package query: {} pins {}\nEndpoint: {}",
                 package,
@@ -343,7 +352,14 @@ fn load_bxl_catalog(root: &Path) -> Result<Vec<vendor_ti::TiCatalogProduct>> {
     let rows: Vec<vendor_ti::TiPackageProduct> = serde_json::from_str(&s)?;
     Ok(rows
         .into_iter()
-        .filter(|r| r.bxl_available != Some(false))
+        // The package catalog is the authoritative BXL queue.  Rows without
+        // an actual BXL URL are metadata-only (including STEP-only rows); do
+        // not turn them into thousands of speculative WEBENCH lookups.
+        .filter(|r| {
+            r.bxl_url
+                .as_deref()
+                .is_some_and(|url| vendor_ti::classify_cad_url(url) == vendor_ti::CadAssetKind::Bxl)
+        })
         .map(|r| vendor_ti::TiCatalogProduct {
             ti_part_number: r.part_number.clone(),
             generic_part_number: Some(r.part_number),
@@ -806,6 +822,251 @@ fn ti_bxl_catalog_failures(root: &Path, verbose: bool) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+fn ti_bxl_rows(root: &Path) -> Result<Vec<vendor_ti::TiPackageProduct>> {
+    let dir = root.join("catalogs/ti-bxl");
+    let path = if dir.join("current.json").exists() {
+        dir.join("current.json")
+    } else {
+        dir.join("partial.json")
+    };
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+#[derive(serde::Serialize)]
+struct CadLinkAudit {
+    product_rows: usize,
+    rows_with_bxl_url: usize,
+    rows_with_step_url: usize,
+    correct_bxl_urls: usize,
+    correct_step_urls: usize,
+    bxl_url_classified_step: usize,
+    step_url_classified_bxl: usize,
+    unknown_cad_urls: usize,
+    same_url_bxl_and_step: usize,
+    unique_correct_bxl_urls: usize,
+    unique_correct_step_urls: usize,
+    suspicious: Vec<serde_json::Value>,
+}
+fn audit_ti_cad_links(root: &Path) -> Result<()> {
+    let rows = ti_bxl_rows(root)?;
+    let mut bxl = std::collections::BTreeSet::new();
+    let mut step = std::collections::BTreeSet::new();
+    let mut audit = CadLinkAudit {
+        product_rows: rows.len(),
+        rows_with_bxl_url: rows.iter().filter(|r| r.bxl_url.is_some()).count(),
+        rows_with_step_url: rows.iter().filter(|r| r.step_url.is_some()).count(),
+        correct_bxl_urls: 0,
+        correct_step_urls: 0,
+        bxl_url_classified_step: 0,
+        step_url_classified_bxl: 0,
+        unknown_cad_urls: 0,
+        same_url_bxl_and_step: 0,
+        unique_correct_bxl_urls: 0,
+        unique_correct_step_urls: 0,
+        suspicious: Vec::new(),
+    };
+    for row in rows {
+        let bxl_kind = row.bxl_url.as_deref().map(vendor_ti::classify_cad_url);
+        let step_kind = row.step_url.as_deref().map(vendor_ti::classify_cad_url);
+        if bxl_kind == Some(vendor_ti::CadAssetKind::Bxl) {
+            audit.correct_bxl_urls += 1;
+            bxl.insert(row.bxl_url.clone().unwrap());
+        }
+        if step_kind == Some(vendor_ti::CadAssetKind::Step) {
+            audit.correct_step_urls += 1;
+            step.insert(row.step_url.clone().unwrap());
+        }
+        if bxl_kind == Some(vendor_ti::CadAssetKind::Step) {
+            audit.bxl_url_classified_step += 1;
+        }
+        if step_kind == Some(vendor_ti::CadAssetKind::Bxl) {
+            audit.step_url_classified_bxl += 1;
+        }
+        let unknown = [bxl_kind, step_kind]
+            .into_iter()
+            .flatten()
+            .filter(|kind| *kind == vendor_ti::CadAssetKind::Unknown)
+            .count();
+        audit.unknown_cad_urls += unknown;
+        if row.bxl_url.is_some() && row.bxl_url == row.step_url {
+            audit.same_url_bxl_and_step += 1;
+        }
+        if bxl_kind == Some(vendor_ti::CadAssetKind::Step)
+            || bxl_kind == Some(vendor_ti::CadAssetKind::Unknown)
+            || step_kind == Some(vendor_ti::CadAssetKind::Bxl)
+            || step_kind == Some(vendor_ti::CadAssetKind::Unknown)
+        {
+            audit.suspicious.push(serde_json::json!({
+                "part_number": row.part_number,
+                "package_code": row.package_code,
+                "pin_count": row.pin_count,
+                "bxl_url": row.bxl_url,
+                "step_url": row.step_url,
+                "bxl_actual": format!("{bxl_kind:?}"),
+                "step_actual": format!("{step_kind:?}"),
+                "source": row.source,
+            }));
+        }
+    }
+    audit.unique_correct_bxl_urls = bxl.len();
+    audit.unique_correct_step_urls = step.len();
+    let report_root = root.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(report_root.join("reports"))?;
+    atomic_write_sync(
+        &report_root.join("reports/ti-cad-link-audit.json"),
+        &(serde_json::to_string_pretty(&audit)? + "\n"),
+    )?;
+    let mut md = String::from("# TI CAD link audit\n\n");
+    md.push_str(&format!("Product rows | {}\n\nRows with BXL URL | {}\n\nRows with STEP URL | {}\n\nCorrect BXL URLs | {}\n\nCorrect STEP URLs | {}\n\nBXL URL classified as STEP | {}\n\nSTEP URL classified as BXL | {}\n\nUnknown CAD URLs | {}\n\nSame URL in both fields | {}\n\nUnique correct BXL URLs | {}\n\nUnique correct STEP URLs | {}\n\n", audit.product_rows, audit.rows_with_bxl_url, audit.rows_with_step_url, audit.correct_bxl_urls, audit.correct_step_urls, audit.bxl_url_classified_step, audit.step_url_classified_bxl, audit.unknown_cad_urls, audit.same_url_bxl_and_step, audit.unique_correct_bxl_urls, audit.unique_correct_step_urls));
+    md.push_str(
+        "## Suspicious rows\n\n| Part | Package | Pins | BXL | STEP |\n|---|---|---:|---|---|\n",
+    );
+    for row in &audit.suspicious {
+        md.push_str(&format!(
+            "| {} | {} | {} | `{}` | `{}` |\n",
+            row["part_number"],
+            row["package_code"],
+            row["pin_count"],
+            row["bxl_url"],
+            row["step_url"]
+        ));
+    }
+    std::fs::write(report_root.join("reports/ti-cad-link-audit.md"), md)?;
+    println!("TI CAD link audit\nProduct rows: {}\nCorrect BXL URLs: {}\nCorrect STEP URLs: {}\nBXL-as-STEP: {}\nSTEP-as-BXL: {}\nUnknown: {}\nUnique BXL URLs: {}\nUnique STEP URLs: {}", audit.product_rows, audit.correct_bxl_urls, audit.correct_step_urls, audit.bxl_url_classified_step, audit.step_url_classified_bxl, audit.unknown_cad_urls, audit.unique_correct_bxl_urls, audit.unique_correct_step_urls);
+    Ok(())
+}
+fn atomic_write_sync(path: &Path, body: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+async fn repair_ti_cad_links(root: &Path, max_queries: Option<usize>) -> Result<()> {
+    let dir = root.join("catalogs/ti-bxl");
+    let mut rows = ti_bxl_rows(root)?;
+    let suspicious = rows
+        .iter()
+        .filter(|row| {
+            row.bxl_url
+                .as_deref()
+                .is_some_and(|u| vendor_ti::classify_cad_url(u) != vendor_ti::CadAssetKind::Bxl)
+                || row.step_url.as_deref().is_some_and(|u| {
+                    vendor_ti::classify_cad_url(u) != vendor_ti::CadAssetKind::Step
+                })
+        })
+        .count();
+    let mut queries = rows
+        .iter()
+        .filter(|r| {
+            r.bxl_url
+                .as_deref()
+                .is_some_and(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Step)
+        })
+        .filter_map(|r| r.package_code.clone().zip(r.pin_count))
+        .collect::<std::collections::BTreeSet<_>>();
+    // A prior repair may already have cleared the bad bxl_url values.  The
+    // old catalog remains immutable, so use all older snapshots as an audit
+    // source to recover package queries that still need a corrected response.
+    let current_bytes = std::fs::read(dir.join("current.json")).unwrap_or_default();
+    let current_hash = format!("{:x}", Sha256::digest(&current_bytes));
+    if let Ok(entries) = std::fs::read_dir(dir.join("snapshots")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "json")
+                || path.file_stem().is_some_and(|x| x == current_hash.as_str())
+            {
+                continue;
+            }
+            let Ok(snapshot) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(snapshot_rows) =
+                serde_json::from_str::<Vec<vendor_ti::TiPackageProduct>>(&snapshot)
+            else {
+                continue;
+            };
+            queries.extend(snapshot_rows.iter().filter_map(|r| {
+                r.bxl_url
+                    .as_deref()
+                    .filter(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Step)?;
+                r.package_code.clone().zip(r.pin_count)
+            }));
+        }
+    }
+    for row in &mut rows {
+        if row
+            .bxl_url
+            .as_deref()
+            .is_some_and(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Step)
+        {
+            if row.step_url.is_none() {
+                row.step_url = row.bxl_url.clone();
+            }
+            row.bxl_url = None;
+        }
+        if row
+            .step_url
+            .as_deref()
+            .is_some_and(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Bxl)
+        {
+            if row.bxl_url.is_none() {
+                row.bxl_url = row.step_url.clone();
+            }
+            row.step_url = None;
+        }
+    }
+    // Re-query only package tuples implicated by the audit. This recovers a
+    // later true BXL link that the old first-match parser may have discarded.
+    let client = Client::builder()
+        .user_agent("eda-library/0.1 TI CAD link repair")
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let mut recovered = 0usize;
+    for (code, pins) in queries.iter().take(max_queries.unwrap_or(usize::MAX)) {
+        let response = client
+            .get(vendor_ti::PRODUCTS_BY_PACKAGE_URL)
+            .query(&[
+                ("packageDesignator", code.as_str()),
+                ("pinCount", &pins.to_string()),
+                ("results", "results"),
+            ])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = response.text().await?;
+        for corrected in
+            vendor_ti::parse_products_by_package(&body, vendor_ti::PRODUCTS_BY_PACKAGE_URL)
+        {
+            if let Some(existing) = rows.iter_mut().find(|r| {
+                r.part_number == corrected.part_number
+                    && r.package_code == corrected.package_code
+                    && r.pin_count == corrected.pin_count
+            }) {
+                if corrected.bxl_url.is_some() {
+                    recovered += (existing.bxl_url.is_none()) as usize;
+                }
+                *existing = corrected;
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.part_number
+            .cmp(&b.part_number)
+            .then(a.package_code.cmp(&b.package_code))
+            .then(a.pin_count.cmp(&b.pin_count))
+    });
+    let body = serde_json::to_string_pretty(&rows)? + "\n";
+    let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+    fs::create_dir_all(dir.join("snapshots")).await?;
+    let snapshot_path = dir.join("snapshots").join(format!("{hash}.json"));
+    if !snapshot_path.exists() {
+        atomic_write(&snapshot_path, &body).await?;
+    }
+    atomic_write(&dir.join("current.json"), &body).await?;
+    println!("TI CAD link repair\nSuspicious rows: {suspicious}\nSuspicious package queries retried: {}\nBXL URLs recovered: {recovered}\nSnapshot: {hash}", queries.len());
     Ok(())
 }
 fn ti_bxl_catalog_pending(root: &Path) -> Result<()> {
@@ -1383,6 +1644,13 @@ async fn run(
         if kind == "texas-instruments" && !with_step && !models_only && a.format != "bxl" {
             return false;
         }
+        if kind == "texas-instruments"
+            && !with_step
+            && !models_only
+            && vendor_ti::classify_cad_url(&a.asset_url) != vendor_ti::CadAssetKind::Bxl
+        {
+            return false;
+        }
         if models_only && !matches!(a.format.as_str(), "step" | "stp") {
             return false;
         }
@@ -1603,15 +1871,11 @@ async fn discover_catalog_cached(
         if !seen.insert(format!("{generic}|{package_key}")) {
             continue;
         }
-        if let Some(x) = cache.get(&generic) {
-            if x.status == "HasCad" {
-                out.extend(x.assets.iter().cloned().map(|mut a| {
-                    a.mpn = p.ti_part_number.clone();
-                    a
-                }));
-            }
-            continue;
-        }
+        // The package catalog's direct links are stronger provenance than a
+        // per-orderable WEBENCH lookup.  Prefer them even when an older CAD
+        // lookup cache entry exists; otherwise a historical cache can mask a
+        // repaired BXL/STEP classification and trigger thousands of needless
+        // lookups.
         if p.bxl_url.is_some() {
             let mut direct = Vec::new();
             if let Some(url) = &p.bxl_url {
@@ -1659,6 +1923,15 @@ async fn discover_catalog_cached(
                 }
             }
             out.extend(direct);
+            continue;
+        }
+        if let Some(x) = cache.get(&generic) {
+            if x.status == "HasCad" {
+                out.extend(x.assets.iter().cloned().map(|mut a| {
+                    a.mpn = p.ti_part_number.clone();
+                    a
+                }));
+            }
             continue;
         }
         let assets = match vendor_ti::discover_catalog_product(p).await {
@@ -1804,6 +2077,10 @@ async fn download(client: &Client, root: &Path, asset: &AssetRecord) -> Result<M
     } else {
         fs::rename(&tmp, &object).await?;
     }
+    let manifest_format = format_from_filename(&filename);
+    if asset.format == "bxl" && manifest_format != "bxl" {
+        anyhow::bail!("type mismatch: requested bxl, returned {manifest_format}");
+    }
     Ok(ManifestRecord {
         manufacturer: asset.manufacturer.clone(),
         mpn: asset.mpn.clone(),
@@ -1811,7 +2088,7 @@ async fn download(client: &Client, root: &Path, asset: &AssetRecord) -> Result<M
         asset_url: asset.asset_url.clone(),
         discovery_url: asset.discovery_url.clone(),
         filename: asset.filename.clone(),
-        format: format_from_filename(&filename),
+        format: manifest_format,
         sha256: hash,
         size,
         retrieved_at: Utc::now(),
@@ -1892,6 +2169,7 @@ async fn list(root: &Path, manufacturer: &str) -> Result<()> {
     Ok(())
 }
 async fn stats(root: &Path) -> Result<()> {
+    let mut ti_manifest_records = Vec::<ManifestRecord>::new();
     for entry in walkdir::WalkDir::new(root.join("manifests"))
         .into_iter()
         .filter_map(Result::ok)
@@ -1903,6 +2181,9 @@ async fn stats(root: &Path) -> Result<()> {
         let mut formats = std::collections::BTreeMap::<String, usize>::new();
         for line in s.lines() {
             if let Ok(m) = serde_json::from_str::<ManifestRecord>(line) {
+                if entry.file_name() == "texas-instruments.jsonl" {
+                    ti_manifest_records.push(m.clone());
+                }
                 n += 1;
                 bytes += m.size;
                 *formats.entry(m.format).or_default() += 1;
@@ -1917,64 +2198,77 @@ async fn stats(root: &Path) -> Result<()> {
         );
     }
     let refs = root.join("acquisition/texas-instruments-references.jsonl");
-    let observations = std::fs::read_to_string(&refs)
+    let reference_groups = std::fs::read_to_string(&refs)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Vec<AssetRecord>>(line).ok())
-        .map(|items| items.len())
-        .sum::<usize>();
-    let unique_urls = std::fs::read_to_string(&refs)
+        .collect::<Vec<_>>();
+    let current_rows = ti_bxl_rows(root).unwrap_or_default();
+    let current_urls = current_rows
+        .iter()
+        .filter_map(|row| row.bxl_url.as_deref())
+        .filter(|url| vendor_ti::classify_cad_url(url) == vendor_ti::CadAssetKind::Bxl)
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let manifest_hashes = ti_manifest_records
+        .iter()
+        .map(|m| m.sha256.clone())
+        .collect::<HashSet<_>>();
+    let valid_manifest_urls = ti_manifest_records
+        .iter()
+        .filter(|m| {
+            m.format == "bxl"
+                && object_path(root, &m.sha256, &m.format).exists()
+                && current_urls.contains(&m.asset_url)
+        })
+        .map(|m| m.asset_url.clone())
+        .collect::<HashSet<_>>();
+    let state = std::fs::read_to_string(root.join("acquisition/texas-instruments.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let transient = state
+        .as_ref()
+        .and_then(|s| s.get("failed_transient").and_then(|x| x.as_array()))
+        .map_or(0, |x| x.len());
+    let permanent = state
+        .as_ref()
+        .and_then(|s| s.get("failed_permanent").and_then(|x| x.as_array()))
+        .map_or(0, |x| x.len());
+    let object_hashes = walkdir::WalkDir::new(root.join("objects"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() != ".gitkeep")
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.split('.').next())
+                .map(str::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    let mismatch_count = std::fs::read_to_string(root.join("failures/texas-instruments.jsonl"))
         .unwrap_or_default()
         .lines()
+        .filter(|line| line.to_ascii_lowercase().contains("type mismatch"))
         .count();
-    let state_path = root.join("acquisition/texas-instruments.json");
-    if let Ok(text) = std::fs::read_to_string(state_path) {
-        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
-            let manifest_urls =
-                std::fs::read_to_string(root.join("manifests/texas-instruments.jsonl"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
-                    .map(|m| m.asset_url)
-                    .collect::<HashSet<_>>();
-            let manifest_hashes =
-                std::fs::read_to_string(root.join("manifests/texas-instruments.jsonl"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
-                    .map(|m| m.sha256)
-                    .collect::<HashSet<_>>();
-            let object_hashes = walkdir::WalkDir::new(root.join("objects"))
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_file() && entry.file_name() != ".gitkeep")
-                .filter_map(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.split('.').next())
-                        .map(str::to_owned)
-                })
-                .collect::<HashSet<_>>();
-            println!(
-                "TI BXL catalog: observations={} unique_urls={}\nTI acquisition: complete_urls={} pending_or_failed={}\nRaw storage: objects={} bytes={}\nTI manifest objects={} orphan raw objects={}",
-                observations,
-                unique_urls,
-                manifest_urls.len(),
-                state
-                    .get("failed_transient")
-                    .and_then(|x| x.as_array())
-                    .map_or_else(
-                        || state.get("failures").and_then(|x| x.as_array()).map_or(0, Vec::len),
-                        Vec::len,
-                    ),
-                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count(),
-                walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum::<u64>(),
-                manifest_hashes.len(),
-                object_hashes.difference(&manifest_hashes).count()
-            );
-        }
-    }
+    println!(
+        "TI BXL catalog:\n  observations: {}\n  unique BXL URLs: {}\nTI acquisition (current queue):\n  complete BXL URLs: {}\n  pending BXL URLs: {}\n  transient failures: {}\n  permanent failures: {}\n  type mismatches: {}\nHistorical TI manifest:\n  records: {}\n  unique URLs: {}\n  BXL: {}\n  STEP: {}\n  ZIP: {}\nRaw store:\n  objects: {}\n  manifest-attributed hashes: {}\n  orphan hashes: {}",
+        reference_groups.iter().map(Vec::len).sum::<usize>(),
+        current_urls.len(),
+        valid_manifest_urls.len().min(current_urls.len()),
+        current_urls.len().saturating_sub(valid_manifest_urls.len()),
+        transient,
+        permanent,
+        mismatch_count,
+        ti_manifest_records.len(),
+        ti_manifest_records.iter().map(|m| m.asset_url.as_str()).collect::<HashSet<_>>().len(),
+        ti_manifest_records.iter().filter(|m| m.format == "bxl").count(),
+        ti_manifest_records.iter().filter(|m| matches!(m.format.as_str(), "stp" | "step")).count(),
+        ti_manifest_records.iter().filter(|m| m.format == "zip").count(),
+        object_hashes.len(),
+        manifest_hashes.len(),
+        object_hashes.difference(&manifest_hashes).count()
+    );
     Ok(())
 }
 
