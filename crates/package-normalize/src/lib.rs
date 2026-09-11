@@ -39,6 +39,9 @@ pub struct Fingerprints {
     pub electrical_geometry_hash: String,
     pub manufacturing_hash: String,
     pub full_geometry_hash: String,
+    /// Identity of the bytes-relevant geometry emitted by the KiCad writer.
+    #[serde(default)]
+    pub kicad_footprint_hash: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourcePackage {
@@ -301,6 +304,7 @@ pub fn normalize_package(c: &EdaComponent, p: &Package) -> NormalizedPackage {
         electrical_geometry_hash: hash(&fingerprint(2)),
         manufacturing_hash: hash(&fingerprint(3)),
         full_geometry_hash: hash(&fingerprint(4)),
+        kicad_footprint_hash: hash(&fingerprint(4)),
     };
     let mut warnings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -361,18 +365,21 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
         .iter()
         .flat_map(|c| c.packages.iter().map(|p| normalize_package(c, p)))
         .collect::<Vec<_>>();
-    // Physical groups are useful for analysis, but are not safe KiCad reuse
-    // identities: they intentionally omit numbering and manufacturing data.
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut physical_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut manufacturing_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in &packages {
-        groups
+        physical_groups
+            .entry(p.fingerprints.physical_geometry_hash.clone())
+            .or_default()
+            .push(format!("{}:{}", p.source.mpn, p.source.name));
+        manufacturing_groups
             .entry(p.fingerprints.manufacturing_hash.clone())
             .or_default()
             .push(format!("{}:{}", p.source.mpn, p.source.name));
     }
     let mut used = BTreeSet::new();
     let mut canonical = Vec::new();
-    for (h, names) in &groups {
+    for (h, names) in &manufacturing_groups {
         let ix = packages
             .iter()
             .position(|p| p.fingerprints.manufacturing_hash == *h)
@@ -395,7 +402,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
     DedupeResult {
         packages,
         canonical,
-        physical_groups: groups,
+        physical_groups,
         warnings: Vec::new(),
     }
 }

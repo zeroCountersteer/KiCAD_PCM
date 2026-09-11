@@ -92,7 +92,7 @@ fn main() -> Result<()> {
                     None => resolve_mpn(&c.data, mpn.as_deref())?
                         .context("provide an input or --mpn")?,
                 };
-                convert(input, mpn, manufacturer, &c.data)
+                convert(input, mpn, manufacturer, &c.data, None)
             }
         }
         Command::BxlStats => stats(&c.data),
@@ -133,6 +133,7 @@ fn convert(
     mpn: Option<String>,
     manufacturer: Option<String>,
     data: &Path,
+    references: Option<&[eda_model::AssetRecord]>,
 ) -> Result<()> {
     let bytes = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
@@ -141,6 +142,31 @@ fn convert(
     let manufacturer = manufacturer.unwrap_or_else(|| "Unknown".into());
     let mpn = mpn.unwrap_or_else(|| input.file_stem().unwrap().to_string_lossy().into());
     let c = bxl_parser::canonicalize(&doc, &manufacturer, &mpn, Some(hash));
+    let mut c = c;
+    if let Some(references) = references {
+        let mut mpns = references.iter().map(|r| r.mpn.clone()).collect::<Vec<_>>();
+        mpns.sort();
+        mpns.dedup();
+        c.metadata.insert("associated_mpns".into(), mpns.join(";"));
+        let mut packages = references
+            .iter()
+            .filter_map(|r| r.source_package.clone())
+            .collect::<Vec<_>>();
+        packages.sort();
+        packages.dedup();
+        c.metadata
+            .insert("associated_package_observations".into(), packages.join(";"));
+        c.metadata.insert(
+            "associated_source_urls".into(),
+            references
+                .iter()
+                .map(|r| r.asset_url.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
     let out = data
         .join("derived/components")
         .join(safe(&c.manufacturer))
@@ -151,6 +177,7 @@ fn convert(
                 "\"source_sha256\": \"{}\"",
                 c.source_sha256.as_deref().unwrap_or_default()
             ))
+            && (references.is_none() || existing.contains("\"associated_mpns\""))
         {
             return Ok(());
         }
@@ -184,18 +211,44 @@ fn resolve_mpn(data: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
 }
 fn batch(data: &Path) -> Result<()> {
     let manifest = data.join("manifests/texas-instruments.jsonl");
+    let mut refs = std::collections::BTreeMap::<String, Vec<eda_model::AssetRecord>>::new();
+    for line in fs::read_to_string(data.join("acquisition/texas-instruments-references.jsonl"))
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Ok(items) = serde_json::from_str::<Vec<eda_model::AssetRecord>>(line) {
+            if let Some(first) = items.first() {
+                refs.insert(first.asset_url.clone(), items);
+            }
+        }
+    }
     let mut done = 0;
     for line in fs::read_to_string(manifest)?.lines() {
         let m: ManifestRecord = serde_json::from_str(line)?;
         if m.format != "bxl" {
             continue;
         }
+        let fallback = refs.entry(m.asset_url.clone()).or_insert_with(|| {
+            vec![eda_model::AssetRecord {
+                manufacturer: m.manufacturer.clone(),
+                mpn: m.mpn.clone(),
+                part_url: m.part_url.clone(),
+                asset_url: m.asset_url.clone(),
+                discovery_url: m.discovery_url.clone(),
+                filename: m.filename.clone(),
+                format: m.format.clone(),
+                content_type: m.content_type.clone(),
+                source_package: m.source_package.clone(),
+                request_url: m.request_url.clone(),
+            }]
+        });
         let p = data
             .join("objects")
             .join(&m.sha256[..2])
             .join(format!("{}.bxl", m.sha256));
         if p.exists() {
-            convert(p, Some(m.mpn), Some(m.manufacturer), data)?;
+            let source_refs = Some(fallback.as_slice());
+            convert(p, Some(m.mpn), Some(m.manufacturer), data, source_refs)?;
             done += 1;
         }
     }
@@ -308,7 +361,7 @@ fn kicad_generate(
             let mut m = std::collections::BTreeMap::new();
             for p in &d.packages {
                 if let Some(g) = d.canonical.iter().find(|g| {
-                    g.fingerprints.manufacturing_hash == p.fingerprints.manufacturing_hash
+                    g.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash
                 }) {
                     m.insert(
                         format!(
@@ -345,6 +398,19 @@ fn kicad_generate(
         fs::create_dir_all(&fpdir)?;
         for c in &items {
             for p in &c.packages {
+                if let Some(shape) = p.pads.iter().find_map(|pad| {
+                    (!matches!(
+                        pad.shape.to_ascii_lowercase().as_str(),
+                        "circle" | "oval" | "roundrect" | "rectangle" | "rect"
+                    ))
+                    .then_some(pad.shape.as_str())
+                }) {
+                    report.push_str(&format!(
+                        "* {} / {}: skipped production footprint; unsupported pad shape `{shape}`\n",
+                        c.mpn, p.name
+                    ));
+                    continue;
+                }
                 let out_name = dedupe
                     .as_ref()
                     .and_then(|d| {
@@ -385,7 +451,7 @@ fn kicad_generate(
 fn dname(d: &package_normalize::DedupeResult, p: &package_normalize::NormalizedPackage) -> String {
     d.canonical
         .iter()
-        .find(|x| x.fingerprints.manufacturing_hash == p.fingerprints.manufacturing_hash)
+        .find(|x| x.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash)
         .map(|x| safe(&x.preferred_name))
         .unwrap_or_else(|| safe(&p.source.name))
 }
@@ -579,6 +645,7 @@ fn kicad_check(path: &Path) -> Result<()> {
     let mut symbols = 0;
     let mut footprints = 0;
     let mut errors = 0;
+    let mut parser_errors = 0;
     for e in walkdir::WalkDir::new(path)
         .into_iter()
         .filter_map(Result::ok)
@@ -594,8 +661,47 @@ fn kicad_check(path: &Path) -> Result<()> {
             errors += 1
         }
     }
-    println!("KiCad validation\n\nSymbol libraries       {symbols}\nFootprints             {footprints}\nSyntax errors          {errors}");
-    if errors > 0 {
+    let parser_available = std::process::Command::new("kicad-cli")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if parser_available {
+        let temp = std::env::temp_dir().join(format!("eda-kicad-check-{}", std::process::id()));
+        fs::create_dir_all(&temp)?;
+        for entry in walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let is_sym = entry.path().extension().is_some_and(|x| x == "kicad_sym");
+            let is_pretty = entry.file_type().is_dir()
+                && entry.path().extension().is_some_and(|x| x == "pretty");
+            if !is_sym && !is_pretty {
+                continue;
+            }
+            // KiCad's footprint upgrader requires a new output directory; it
+            // rejects an already-existing directory as an output collision.
+            let output_dir = temp.join(format!("out-{}", entry.path().to_string_lossy().len()));
+            let result = if is_sym {
+                std::process::Command::new("kicad-cli")
+                    .args(["sym", "upgrade", "--output"])
+                    .arg(&output_dir)
+                    .arg(entry.path())
+                    .output()
+            } else {
+                std::process::Command::new("kicad-cli")
+                    .args(["fp", "upgrade", "--output"])
+                    .arg(&output_dir)
+                    .arg(entry.path())
+                    .output()
+            };
+            if !result.is_ok_and(|output| output.status.success()) {
+                parser_errors += 1;
+            }
+        }
+        let _ = fs::remove_dir_all(temp);
+    }
+    println!("KiCad validation\n\nSymbol libraries       {symbols}\nFootprints             {footprints}\nS-expression failures  {errors}\nKiCad parser failures  {}\nKiCad parser validation: {}", parser_errors, if parser_available { "performed" } else { "unavailable" });
+    if errors > 0 || parser_errors > 0 {
         anyhow::bail!("KiCad syntax validation failed")
     }
     Ok(())
@@ -728,6 +834,7 @@ fn safe(s: &str) -> String {
         })
         .collect()
 }
+
 fn model_check(data: &Path, manufacturer: Option<&str>) -> Result<()> {
     let mut raw = 0;
     let mut parsed = 0;
@@ -821,4 +928,23 @@ fn model_info(data: &Path, query: &str) -> Result<()> {
         }
     }
     anyhow::bail!("model not found: {query}")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn decoded_bxl_to_kicad_preserves_through_hole_drill() {
+        let doc = bxl_model::BxlDocument {
+            version: None,
+            records: Vec::new(),
+            raw_text: Some("PadStack \"TH\"\nPadShape \"Circle\" (Width 40) (Height 40)\n(Drill 20)\nEndPadStack\nPattern \"DIP2\"\nPad (Number 1) (PinName \"A\") (PadStyle \"TH\") (Origin 0, 0)\nSymbol \"U1\"\nPin (PinNum 1) (Origin 0, 0) (PinLength 10)\nPinName \"A\"\nEndSymbol\n".into()),
+        };
+        let component = bxl_parser::canonicalize(&doc, "TI", "TEST", None);
+        let pad = &component.packages[0].pads[0];
+        assert!(pad.drill.as_ref().is_some_and(|d| d.x_nm > 0));
+        let output = kicad::footprint(&component, &component.packages[0]);
+        assert!(output.contains("thru_hole"));
+        assert!(output.contains("(drill "));
+        assert!(!output.contains("(attr smd)"));
+    }
 }

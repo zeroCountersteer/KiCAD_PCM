@@ -1355,7 +1355,7 @@ async fn run(
     _display: &str,
     kind: &str,
     limit: Option<usize>,
-    _resume: bool,
+    resume: bool,
     dry: bool,
     concurrency: usize,
     root: &Path,
@@ -1441,40 +1441,72 @@ async fn run(
         .timeout(Duration::from_secs(45))
         .build()?;
     let manifest_path = root.join("manifests").join(format!("{kind}.jsonl"));
-    let manifest_known: HashSet<String> = fs::read_to_string(&manifest_path)
-        .await
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<ManifestRecord>(l).ok())
-        .map(|m| m.asset_url)
-        .collect();
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct AcquisitionState {
         completed: std::collections::BTreeSet<String>,
         in_progress: std::collections::BTreeSet<String>,
+        #[serde(default)]
+        failed_transient: std::collections::BTreeSet<String>,
+        #[serde(default)]
+        failed_permanent: std::collections::BTreeSet<String>,
+        #[serde(default)]
         failures: std::collections::BTreeSet<String>,
     }
     let state_path = root.join("acquisition").join(format!("{kind}.json"));
     fs::create_dir_all(state_path.parent().unwrap()).await?;
-    let mut state: AcquisitionState = if _resume && fs::try_exists(&state_path).await? {
+    let mut state: AcquisitionState = if resume && fs::try_exists(&state_path).await? {
         serde_json::from_str(&fs::read_to_string(&state_path).await?).unwrap_or_default()
     } else {
         AcquisitionState::default()
     };
     state.in_progress.clear();
-    let known: HashSet<String> = manifest_known
+    // A URL is complete only when its manifest entry points at an existing
+    // object. A stale state-file entry alone is not durable acquisition proof.
+    let manifest_records = fs::read_to_string(&manifest_path)
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
+        .collect::<Vec<_>>();
+    let mut evidenced = HashSet::new();
+    for record in manifest_records {
+        if fs::try_exists(object_path(root, &record.sha256, &record.format)).await? {
+            evidenced.insert(record.asset_url);
+        }
+    }
+    let current_urls = assets
+        .iter()
+        .map(|a| a.asset_url.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let stale = state
+        .completed
+        .intersection(&current_urls)
+        .filter(|url| !evidenced.contains(*url))
+        .count();
+    state.completed.retain(|url| evidenced.contains(url));
+    state
+        .failed_transient
+        .extend(std::mem::take(&mut state.failures));
+    state
+        .failed_transient
+        .retain(|url| !state.failed_permanent.contains(url));
+    let known: HashSet<String> = evidenced
         .into_iter()
-        .chain(state.completed.iter().cloned())
+        .filter(|url| current_urls.contains(url))
         .collect();
     let unique_urls = assets.len();
     let mut pending = assets
         .into_iter()
-        .filter(|a| !known.contains(&a.asset_url))
+        .filter(|a| {
+            !known.contains(&a.asset_url)
+                && !state.failed_permanent.contains(&a.asset_url)
+                && (resume || !state.failed_transient.contains(&a.asset_url))
+        })
         .collect::<Vec<_>>();
     if let Some(n) = max_assets {
         pending.truncate(n);
     }
-    println!("TI BXL acquisition\nCatalog observations: {}\nUnique BXL URLs: {}\nAlready complete: {}\nPending: {}\nTransient failures: {}", discovered_assets, unique_urls, known.len(), pending.len(), state.failures.len());
+    println!("TI BXL acquisition\nCatalog observations: {}\nCurrent unique BXL URLs: {}\nCurrent complete URLs: {}\nPending URLs: {}\nTransient failures: {}\nPermanent failures: {}{}", discovered_assets, unique_urls, known.len(), pending.len(), state.failed_transient.len(), state.failed_permanent.len(), if stale > 0 { format!("\nInconsistent completed entries demoted: {stale}") } else { String::new() });
     let mut manifest = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1508,6 +1540,8 @@ async fn run(
                     .await?;
                 manifest.write_all(b"\n").await?;
                 state.completed.insert(asset.asset_url.clone());
+                state.failed_transient.remove(&asset.asset_url);
+                state.failed_permanent.remove(&asset.asset_url);
                 ok += 1;
             }
             Err(e) => {
@@ -1533,7 +1567,11 @@ async fn run(
                     .await?;
                 file.write_all(format!("{}\n", serde_json::to_string(&f)?).as_bytes())
                     .await?;
-                state.failures.insert(asset_url);
+                if is_transient_download_error(&e.to_string()) {
+                    state.failed_transient.insert(asset_url);
+                } else {
+                    state.failed_permanent.insert(asset_url);
+                }
             }
         }
         atomic_write(&state_path, &serde_json::to_string_pretty(&state)?).await?;
@@ -1794,6 +1832,21 @@ fn object_path(root: &Path, sha256: &str, format: &str) -> PathBuf {
         .join(format!("{sha256}.{normalized}"))
 }
 
+fn is_transient_download_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("timeout")
+        || lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("resolve")
+        || lower.contains("429")
+        || lower.contains("408")
+        || lower.contains("500")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("request failed after retries")
+}
+
 fn validate_content(filename: &str, content_type: Option<&str>, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         anyhow::bail!("zero-length response")
@@ -1908,7 +1961,13 @@ async fn stats(root: &Path) -> Result<()> {
                 observations,
                 unique_urls,
                 manifest_urls.len(),
-                state.get("failures").and_then(|x| x.as_array()).map_or(0, Vec::len),
+                state
+                    .get("failed_transient")
+                    .and_then(|x| x.as_array())
+                    .map_or_else(
+                        || state.get("failures").and_then(|x| x.as_array()).map_or(0, Vec::len),
+                        Vec::len,
+                    ),
                 walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count(),
                 walkdir::WalkDir::new(root.join("objects")).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum::<u64>(),
                 manifest_hashes.len(),

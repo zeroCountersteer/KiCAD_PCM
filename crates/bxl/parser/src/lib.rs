@@ -73,6 +73,11 @@ pub fn canonicalize(
                 stacks.insert(k, (m[1].into(), mil_nm(&m[2]), mil_nm(&m[3])));
             }
         }
+        if let Some(m) = drill_re.captures(line) {
+            if let Some(k) = current.clone() {
+                stack_drills.insert(k, mil_nm(&m[1]));
+            }
+        }
         if line.contains("EndPadStack") {
             current = None
         }
@@ -99,11 +104,6 @@ pub fn canonicalize(
     let mut explicit_maps: BTreeMap<String, String> = BTreeMap::new();
     let mut patterns = Vec::new();
     for line in text.lines() {
-        if let Some(m) = drill_re.captures(line) {
-            if let Some(k) = current.clone() {
-                stack_drills.insert(k, mil_nm(&m[1]));
-            }
-        }
         if let Some(m) = pin_map_re.captures(line) {
             let pin = m.get(1).or_else(|| m.get(3)).map(|x| x.as_str());
             let pad = m.get(2).or_else(|| m.get(4)).map(|x| x.as_str());
@@ -154,7 +154,10 @@ pub fn canonicalize(
                     drill: stack_drills
                         .get(&m[3])
                         .map(|d| Point { x_nm: *d, y_nm: *d }),
-                    plated: Some(!m[3].to_ascii_lowercase().contains("npth")),
+                    // PadStyle is a geometry/style identifier, not a plating
+                    // declaration. Leave plating unknown unless an explicit
+                    // source attribute is decoded.
+                    plated: None,
                     ..Default::default()
                 })
             }
@@ -290,5 +293,33 @@ mod tests {
     fn parses_text_records() {
         let d = parse_text_records("HEADER 1\nPIN 1 A");
         assert_eq!(d[1].kind, "PIN");
+    }
+
+    #[test]
+    fn canonicalizes_stack_mapping_and_pattern_relationships() {
+        let doc = BxlDocument {
+            version: None,
+            records: Vec::new(),
+            raw_text: Some("PadStack \"TH\"\nPadShape \"Circle\" (Width 40) (Height 40)\n(Drill 20)\nEndPadStack\nPattern \"DIP2\"\nPatternName \"DIP2\"\nAlternatePattern \"DIP2-HAND\"\nPad (Number 1) (PinName \"A\") (PadStyle \"TH\") (Origin 0, 0)\nComponent \"U1\"\nPinMap (PinNum 1) (PadNum 1)\nSymbol \"U1\"\nPin (PinNum 1) (Origin 0, 0) (PinLength 10) (ElectricalType \"Input\")\nPinName \"A\"\nEndSymbol\n".into()),
+        };
+        let component = canonicalize(&doc, "TI", "TEST", None);
+        let pad = &component.packages[0].pads[0];
+        assert_eq!(
+            pad.drill,
+            Some(Point {
+                x_nm: 508000,
+                y_nm: 508000
+            })
+        );
+        assert_eq!(pad.plated, None);
+        let mapping = &component.pin_map[0];
+        assert_eq!(mapping.pad_ref.as_deref(), Some("1"));
+        assert!(mapping.explicit);
+        assert!(component
+            .metadata
+            .get("pattern_relationships")
+            .is_some_and(
+                |v| v.contains("PatternName:DIP2") && v.contains("AlternatePattern:DIP2-HAND")
+            ));
     }
 }
