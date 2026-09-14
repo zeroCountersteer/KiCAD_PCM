@@ -6,8 +6,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    thread,
 };
 #[derive(Parser)]
 struct Cli {
@@ -308,7 +310,22 @@ fn batch(data: &Path) -> Result<()> {
     report.type_mismatches = corpus.type_mismatches.len();
     report.ambiguous = corpus.ambiguous_urls.len();
     report.output_collisions = collisions.len();
-    report.stale_derived_files = stale_derived_files(data, &plans)?;
+    report.stale_derived_before = stale_derived_files(data, &plans)?;
+    report.missing_details = corpus
+        .missing_urls
+        .iter()
+        .map(|url| FailureDetail::url("missing", url))
+        .collect();
+    report.type_mismatch_details = corpus
+        .type_mismatches
+        .iter()
+        .map(|url| FailureDetail::url("type_mismatch", url))
+        .collect();
+    report.ambiguous_details = corpus
+        .ambiguous_urls
+        .iter()
+        .map(|url| FailureDetail::url("ambiguous", url))
+        .collect();
     if !collisions.is_empty() {
         report.failure_count =
             report.missing + report.type_mismatches + report.ambiguous + report.output_collisions;
@@ -318,18 +335,30 @@ fn batch(data: &Path) -> Result<()> {
             collisions.len()
         );
     }
-    let parsed = parse_bxl_documents(&plans);
     for plan in &plans {
-        let doc = match parsed.get(&plan.sha).expect("planned SHA has parse result") {
+        let bytes = match fs::read(&plan.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.parse_failures += 1;
+                report
+                    .parse_failure_details
+                    .push(FailureDetail::parse(plan, error.to_string()));
+                continue;
+            }
+        };
+        let doc = match bxl_parser::parse(&bytes) {
             Ok(doc) => doc,
             Err(error) => {
                 eprintln!("{}: {}", plan.path.display(), error);
                 report.parse_failures += 1;
+                report
+                    .parse_failure_details
+                    .push(FailureDetail::parse(plan, error.to_string()));
                 continue;
             }
         };
         let mut c = bxl_parser::canonicalize(
-            doc,
+            &doc,
             "Texas Instruments",
             &plan.primary,
             Some(plan.sha.clone()),
@@ -357,6 +386,7 @@ fn batch(data: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_bxl_documents(
     plans: &[ConversionPlan],
 ) -> BTreeMap<String, std::result::Result<bxl_model::BxlDocument, String>> {
@@ -406,13 +436,66 @@ struct ConversionReport {
     type_mismatches: usize,
     ambiguous: usize,
     output_collisions: usize,
-    stale_derived_files: usize,
+    stale_derived_before: usize,
     failure_count: usize,
+    #[serde(default)]
+    parse_failure_details: Vec<FailureDetail>,
+    #[serde(default)]
+    missing_details: Vec<FailureDetail>,
+    #[serde(default)]
+    type_mismatch_details: Vec<FailureDetail>,
+    #[serde(default)]
+    ambiguous_details: Vec<FailureDetail>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct FailureDetail {
+    kind: String,
+    sha256: Option<String>,
+    path: Option<String>,
+    urls: Vec<String>,
+    mpns: Vec<String>,
+    error: Option<String>,
+}
+
+impl FailureDetail {
+    fn url(kind: &str, url: &str) -> Self {
+        Self {
+            kind: kind.into(),
+            sha256: None,
+            path: None,
+            urls: vec![url.into()],
+            mpns: Vec::new(),
+            error: None,
+        }
+    }
+    fn parse(plan: &ConversionPlan, error: String) -> Self {
+        Self {
+            kind: "parse".into(),
+            sha256: Some(plan.sha.clone()),
+            path: Some(plan.path.display().to_string()),
+            urls: plan
+                .references
+                .iter()
+                .map(|r| r.asset_url.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            mpns: plan
+                .references
+                .iter()
+                .map(|r| r.mpn.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            error: Some(error),
+        }
+    }
 }
 
 impl ConversionReport {
     fn to_markdown(&self) -> String {
-        format!("# TI BXL conversion\n\n| Metric | Count |\n|---|---:|\n| Observations | {} |\n| URLs | {} |\n| SHAs | {} |\n| Written | {} |\n| Reused | {} |\n| Parse failures | {} |\n| Missing | {} |\n| Type mismatches | {} |\n| Ambiguous | {} |\n| Output collisions | {} |\n| Stale derived files | {} |\n| Failures | {} |\n", self.observations, self.urls, self.shas, self.written, self.reused, self.parse_failures, self.missing, self.type_mismatches, self.ambiguous, self.output_collisions, self.stale_derived_files, self.failure_count)
+        format!("# TI BXL conversion\n\n| Metric | Count |\n|---|---:|\n| Observations | {} |\n| URLs | {} |\n| SHAs | {} |\n| Written | {} |\n| Reused | {} |\n| Parse failures | {} |\n| Missing | {} |\n| Type mismatches | {} |\n| Ambiguous | {} |\n| Output collisions | {} |\n| Stale derived files before run | {} |\n| Failures | {} |\n", self.observations, self.urls, self.shas, self.written, self.reused, self.parse_failures, self.missing, self.type_mismatches, self.ambiguous, self.output_collisions, self.stale_derived_before, self.failure_count)
     }
 }
 
@@ -628,19 +711,6 @@ fn load_current_ti_bxl_corpus(data: &Path) -> Result<CurrentBxlCorpus> {
 }
 
 fn stats(data: &Path) -> Result<()> {
-    let exe = std::env::current_exe().context("locate eda-convert executable")?;
-    let output = ProcessCommand::new(exe)
-        .arg("--data")
-        .arg(data)
-        .arg("bxl-stats-worker")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .context("run quiet BXL statistics worker")?;
-    if !output.status.success() {
-        anyhow::bail!("BXL statistics worker failed with {}", output.status);
-    }
-    let result: BxlStatsResult = serde_json::from_slice(&output.stdout)?;
     let corpus = load_current_ti_bxl_corpus(data)?;
     let current_objects = corpus
         .assets
@@ -648,6 +718,40 @@ fn stats(data: &Path) -> Result<()> {
         .map(|a| a.sha256.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    println!(
+        "BXL stats\nCurrent BXL URLs: {}\nCurrent SHA objects: {}\n",
+        corpus.unique_urls, current_objects
+    );
+    let exe = std::env::current_exe().context("locate eda-convert executable")?;
+    let mut child = ProcessCommand::new(exe)
+        .arg("--data")
+        .arg(data)
+        .arg("bxl-stats-worker")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run quiet BXL statistics worker")?;
+    let stderr = child.stderr.take().expect("worker stderr was piped");
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut output);
+        output
+    });
+    let output = child
+        .wait_with_output()
+        .context("wait for BXL statistics worker")?;
+    for line in stderr_reader.join().unwrap_or_default().lines() {
+        if let Some(progress) = line.strip_prefix("BXL_PROGRESS ") {
+            let mut values = progress.split_whitespace();
+            if let (Some(done), Some(total)) = (values.next(), values.next()) {
+                println!("BXL stats: {done}/{total} objects");
+            }
+        }
+    }
+    if !output.status.success() {
+        anyhow::bail!("BXL statistics worker failed with {}", output.status);
+    }
+    let result: BxlStatsResult = serde_json::from_slice(&output.stdout)?;
     let historical = walkdir::WalkDir::new(data.join("objects"))
         .into_iter()
         .filter_map(Result::ok)
@@ -684,7 +788,7 @@ fn stats_worker(data: &Path) -> Result<()> {
     eprintln!("BXL stats: processing {total} current SHA objects");
     for (index, path) in paths.into_iter().enumerate() {
         if index == 0 || (index + 1) % 100 == 0 || index + 1 == total {
-            eprintln!("BXL stats: {}/{} objects", index + 1, total);
+            eprintln!("BXL_PROGRESS {} {}", index + 1, total);
         }
         result.objects_processed += 1;
         let bytes = fs::read(&path)?;
