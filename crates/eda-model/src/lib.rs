@@ -79,6 +79,8 @@ pub struct EdaComponent {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub pin_map: Vec<ComponentPinMap>,
+    #[serde(default)]
+    pub canonicalizer_version: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ComponentPinMap {

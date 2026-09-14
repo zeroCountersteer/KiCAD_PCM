@@ -6,6 +6,7 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v2";
 /// Decompresses the proprietary BXL container using the compatible GPL-3 bxl-rs
 /// implementation. The decoded stream is retained for the next grammar phase.
 pub fn parse(bytes: &[u8]) -> Result<BxlDocument> {

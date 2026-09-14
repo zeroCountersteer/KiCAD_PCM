@@ -4,6 +4,7 @@ use eda_model::EdaComponent;
 use eda_model::ManifestRecord;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -146,7 +147,16 @@ fn convert(
     let manufacturer = manufacturer.unwrap_or_else(|| "Unknown".into());
     let mpn = mpn.unwrap_or_else(|| input.file_stem().unwrap().to_string_lossy().into());
     let c = bxl_parser::canonicalize(&doc, &manufacturer, &mpn, Some(hash));
-    let mut c = c;
+    write_component(c, &input, data, references)
+}
+
+fn write_component(
+    mut c: EdaComponent,
+    input: &Path,
+    data: &Path,
+    references: Option<&[eda_model::AssetRecord]>,
+) -> Result<()> {
+    c.canonicalizer_version = bxl_parser::BXL_CANONICALIZER_VERSION.into();
     if let Some(references) = references {
         let mut mpns = references.iter().map(|r| r.mpn.clone()).collect::<Vec<_>>();
         mpns.sort();
@@ -170,6 +180,27 @@ fn convert(
                 .collect::<Vec<_>>()
                 .join(";"),
         );
+        c.metadata.insert(
+            "associated_product_urls".into(),
+            references
+                .iter()
+                .map(|r| r.part_url.clone())
+                .filter(|url| !url.is_empty())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+        c.metadata.insert(
+            "associated_discovery_urls".into(),
+            references
+                .iter()
+                .filter_map(|r| r.discovery_url.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
     }
     let out = data
         .join("derived/components")
@@ -177,6 +208,10 @@ fn convert(
         .join(format!("{}.json", safe(&c.mpn)));
     if let Ok(existing) = fs::read_to_string(&out) {
         if existing.contains("\"pin_map\"")
+            && existing.contains(&format!(
+                "\"canonicalizer_version\": \"{}\"",
+                bxl_parser::BXL_CANONICALIZER_VERSION
+            ))
             && existing.contains(&format!(
                 "\"source_sha256\": \"{}\"",
                 c.source_sha256.as_deref().unwrap_or_default()
@@ -214,49 +249,47 @@ fn resolve_mpn(data: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 fn batch(data: &Path) -> Result<()> {
-    let manifest = data.join("manifests/texas-instruments.jsonl");
-    let mut refs = std::collections::BTreeMap::<String, Vec<eda_model::AssetRecord>>::new();
-    for line in fs::read_to_string(data.join("acquisition/texas-instruments-references.jsonl"))
-        .unwrap_or_default()
-        .lines()
-    {
-        if let Ok(items) = serde_json::from_str::<Vec<eda_model::AssetRecord>>(line) {
-            if let Some(first) = items.first() {
-                refs.insert(first.asset_url.clone(), items);
-            }
-        }
+    let corpus = load_current_ti_bxl_corpus(data)?;
+    let mut by_sha: BTreeMap<String, (PathBuf, Vec<eda_model::AssetRecord>)> = BTreeMap::new();
+    for asset in &corpus.assets {
+        debug_assert_eq!(asset.sha256, asset.manifest.sha256);
+        let entry = by_sha
+            .entry(asset.sha256.clone())
+            .or_insert_with(|| (asset.object_path.clone(), Vec::new()));
+        entry.1.extend(asset.references.clone());
     }
-    let mut done = 0;
-    for line in fs::read_to_string(manifest)?.lines() {
-        let m: ManifestRecord = serde_json::from_str(line)?;
-        if m.format != "bxl" {
-            continue;
-        }
-        let fallback = refs.entry(m.asset_url.clone()).or_insert_with(|| {
-            vec![eda_model::AssetRecord {
-                manufacturer: m.manufacturer.clone(),
-                mpn: m.mpn.clone(),
-                part_url: m.part_url.clone(),
-                asset_url: m.asset_url.clone(),
-                discovery_url: m.discovery_url.clone(),
-                filename: m.filename.clone(),
-                format: m.format.clone(),
-                content_type: m.content_type.clone(),
-                source_package: m.source_package.clone(),
-                request_url: m.request_url.clone(),
-            }]
+    let unique_shas = by_sha.len();
+    let mut parsed: BTreeMap<String, std::result::Result<bxl_model::BxlDocument, String>> =
+        BTreeMap::new();
+    let mut converted = 0;
+    let mut parse_failures = 0;
+    for (sha, (path, references)) in by_sha {
+        let result = parsed.entry(sha.clone()).or_insert_with(|| {
+            fs::read(&path)
+                .and_then(|bytes| bxl_parser::parse(&bytes).map_err(std::io::Error::other))
+                .map_err(|e| e.to_string())
         });
-        let p = data
-            .join("objects")
-            .join(&m.sha256[..2])
-            .join(format!("{}.bxl", m.sha256));
-        if p.exists() {
-            let source_refs = Some(fallback.as_slice());
-            convert(p, Some(m.mpn), Some(m.manufacturer), data, source_refs)?;
-            done += 1;
-        }
+        let doc = match result {
+            Ok(doc) => doc,
+            Err(error) => {
+                eprintln!("{}: {}", path.display(), error);
+                parse_failures += 1;
+                continue;
+            }
+        };
+        let primary = references
+            .iter()
+            .map(|r| r.mpn.as_str())
+            .min()
+            .unwrap_or("unknown");
+        let mut c = bxl_parser::canonicalize(doc, "Texas Instruments", primary, Some(sha));
+        c.canonicalizer_version = bxl_parser::BXL_CANONICALIZER_VERSION.into();
+        write_component(c, &path, data, Some(&references))?;
+        converted += 1;
     }
-    println!("converted {done} BXL observations");
+    println!("BXL conversion\n\nCurrent observations       {}\nCurrent unique URLs         {}\nCurrent unique SHAs         {}\nCanonical components        {}\nParse failures              {}\nMissing URLs                 {}\nType mismatches              {}\nAmbiguous URLs               {}\nHistorical BXL URLs not current {}",
+        corpus.observations, corpus.unique_urls, unique_shas, converted, parse_failures,
+        corpus.missing_urls.len(), corpus.type_mismatches.len(), corpus.ambiguous_urls.len(), corpus.historical_bxl_urls.len());
     Ok(())
 }
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -270,42 +303,150 @@ struct BxlStatsResult {
     decoded_bytes: u64,
 }
 
-fn current_bxl_paths(data: &Path) -> Result<(Vec<PathBuf>, usize)> {
+#[derive(Clone)]
+struct CurrentBxlAsset {
+    asset_url: String,
+    sha256: String,
+    object_path: PathBuf,
+    manifest: ManifestRecord,
+    references: Vec<eda_model::AssetRecord>,
+}
+
+struct CurrentBxlCorpus {
+    observations: usize,
+    unique_urls: usize,
+    assets: Vec<CurrentBxlAsset>,
+    missing_urls: Vec<String>,
+    type_mismatches: Vec<String>,
+    ambiguous_urls: Vec<String>,
+    historical_bxl_urls: Vec<String>,
+}
+
+fn load_current_ti_bxl_corpus(data: &Path) -> Result<CurrentBxlCorpus> {
     let current = data.join("catalogs/ti-bxl/current.json");
     let rows: Vec<vendor_ti::TiPackageProduct> = if current.exists() {
         serde_json::from_str(&fs::read_to_string(current)?)?
     } else {
         Vec::new()
     };
-    let urls = rows
-        .iter()
-        .filter_map(|r| r.bxl_url.as_deref())
-        .filter(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Bxl)
-        .collect::<std::collections::HashSet<_>>();
-    let records = fs::read_to_string(data.join("manifests/texas-instruments.jsonl"))
+    let mut references = BTreeMap::<String, Vec<eda_model::AssetRecord>>::new();
+    for row in rows {
+        let Some(url) = row.bxl_url else { continue };
+        if vendor_ti::classify_cad_url(&url) != vendor_ti::CadAssetKind::Bxl {
+            continue;
+        }
+        references
+            .entry(url.clone())
+            .or_default()
+            .push(eda_model::AssetRecord {
+                manufacturer: "Texas Instruments".into(),
+                mpn: row.part_number,
+                part_url: row.product_url.unwrap_or_default(),
+                asset_url: url.clone(),
+                discovery_url: Some(row.source),
+                filename: url.rsplit('/').next().unwrap_or(&url).into(),
+                format: "bxl".into(),
+                content_type: None,
+                source_package: Some(format!(
+                    "{};pins={}",
+                    row.package_code.unwrap_or_default(),
+                    row.pin_count.map_or_else(|| "".into(), |n| n.to_string())
+                )),
+                request_url: None,
+            });
+    }
+    let observations = references.values().map(Vec::len).sum();
+    // Acquisition references enrich provenance only; they never add URLs to
+    // the current corpus. The catalog above remains the membership authority.
+    for line in fs::read_to_string(data.join("acquisition/texas-instruments-references.jsonl"))
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| serde_json::from_str::<ManifestRecord>(line).ok())
-        .filter(|m| m.format == "bxl" && urls.contains(m.asset_url.as_str()))
-        .collect::<Vec<_>>();
-    let mut paths = records
+    {
+        let Ok(items) = serde_json::from_str::<Vec<eda_model::AssetRecord>>(line) else {
+            continue;
+        };
+        for item in items {
+            if let Some(group) = references.get_mut(&item.asset_url) {
+                if !group.contains(&item) {
+                    group.push(item);
+                }
+            }
+        }
+    }
+    let mut manifest_by_url = BTreeMap::<String, Vec<ManifestRecord>>::new();
+    for line in fs::read_to_string(data.join("manifests/texas-instruments.jsonl"))
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Ok(m) = serde_json::from_str::<ManifestRecord>(line) {
+            manifest_by_url
+                .entry(m.asset_url.clone())
+                .or_default()
+                .push(m);
+        }
+    }
+    let mut corpus = CurrentBxlCorpus {
+        observations,
+        unique_urls: references.len(),
+        assets: Vec::new(),
+        missing_urls: Vec::new(),
+        type_mismatches: Vec::new(),
+        ambiguous_urls: Vec::new(),
+        historical_bxl_urls: Vec::new(),
+    };
+    corpus.historical_bxl_urls = manifest_by_url
         .iter()
-        .map(|m| {
-            data.join("objects")
-                .join(&m.sha256[..2])
-                .join(format!("{}.bxl", m.sha256))
+        .filter(|(url, records)| {
+            !references.contains_key(*url) && records.iter().any(|m| m.format == "bxl")
         })
-        .filter(|p| p.exists())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    let historical = walkdir::WalkDir::new(data.join("objects"))
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "bxl"))
-        .count()
-        .saturating_sub(paths.len());
-    Ok((paths, historical))
+        .map(|(url, _)| url.clone())
+        .collect();
+    for (url, refs) in references {
+        let all = manifest_by_url.get(&url).cloned().unwrap_or_default();
+        let bxl = all
+            .iter()
+            .filter(|m| m.format == "bxl")
+            .cloned()
+            .collect::<Vec<_>>();
+        if bxl.is_empty() {
+            if all.is_empty() {
+                corpus.missing_urls.push(url);
+            } else {
+                corpus.type_mismatches.push(url);
+            }
+            continue;
+        }
+        let shas = bxl
+            .iter()
+            .map(|m| m.sha256.clone())
+            .collect::<BTreeSet<_>>();
+        if shas.len() != 1 {
+            corpus.ambiguous_urls.push(url);
+            continue;
+        }
+        let sha = shas.into_iter().next().unwrap();
+        if sha.len() < 2 {
+            corpus.missing_urls.push(url);
+            continue;
+        }
+        let object_path = data
+            .join("objects")
+            .join(&sha[..2])
+            .join(format!("{sha}.bxl"));
+        if !object_path.exists() {
+            corpus.missing_urls.push(url.clone());
+            continue;
+        }
+        corpus.assets.push(CurrentBxlAsset {
+            asset_url: url,
+            sha256: sha,
+            object_path,
+            manifest: bxl.into_iter().next().unwrap(),
+            references: refs,
+        });
+    }
+    corpus.assets.sort_by(|a, b| a.asset_url.cmp(&b.asset_url));
+    Ok(corpus)
 }
 
 fn stats(data: &Path) -> Result<()> {
@@ -322,16 +463,29 @@ fn stats(data: &Path) -> Result<()> {
         anyhow::bail!("BXL statistics worker failed with {}", output.status);
     }
     let result: BxlStatsResult = serde_json::from_slice(&output.stdout)?;
-    let (_, historical) = current_bxl_paths(data)?;
+    let corpus = load_current_ti_bxl_corpus(data)?;
+    let current_objects = corpus
+        .assets
+        .iter()
+        .map(|a| a.sha256.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let historical = walkdir::WalkDir::new(data.join("objects"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bxl"))
+        .count()
+        .saturating_sub(current_objects);
     println!(
-        "BXL corpus\n\nCurrent-corpus BXL objects       {}\nHistorical BXL objects            {}\nObjects processed                 {}\nParsed successfully               {}\nDecompression failures            {}\nUTF-8 failures                    {}\nCanonicalization warnings         {}\n\nCompressed bytes                  {}\nDecoded bytes                     {}",
-        result.objects_processed,
+        "BXL corpus\n\nCurrent observations              {}\nCurrent unique BXL URLs           {}\nCurrent-corpus BXL objects       {}\nHistorical BXL objects            {}\nObjects processed                 {}\nParsed successfully               {}\nDecompression failures            {}\nUTF-8 failures                    {}\nCanonicalization warnings         {}\nMissing URLs                      {}\nType mismatches                   {}\nAmbiguous URLs                    {}\nHistorical BXL URLs not current  {}\n\nCompressed bytes                  {}\nDecoded bytes                     {}",
+        corpus.observations, corpus.unique_urls, current_objects,
         historical,
         result.objects_processed,
         result.parsed_successfully,
         result.decompression_failures,
         result.utf8_failures,
         result.canonicalization_warnings,
+        corpus.missing_urls.len(), corpus.type_mismatches.len(), corpus.ambiguous_urls.len(), corpus.historical_bxl_urls.len(),
         result.compressed_bytes,
         result.decoded_bytes
     );
@@ -339,7 +493,14 @@ fn stats(data: &Path) -> Result<()> {
 }
 
 fn stats_worker(data: &Path) -> Result<()> {
-    let (paths, _) = current_bxl_paths(data)?;
+    let corpus = load_current_ti_bxl_corpus(data)?;
+    let mut paths = corpus
+        .assets
+        .iter()
+        .map(|a| a.object_path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
     let mut result = BxlStatsResult::default();
     for path in paths {
         result.objects_processed += 1;
