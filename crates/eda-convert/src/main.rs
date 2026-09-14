@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     thread,
@@ -733,21 +733,22 @@ fn stats(data: &Path) -> Result<()> {
         .context("run quiet BXL statistics worker")?;
     let stderr = child.stderr.take().expect("worker stderr was piped");
     let stderr_reader = thread::spawn(move || {
-        let mut output = String::new();
-        let _ = std::io::BufReader::new(stderr).read_to_string(&mut output);
-        output
+        for line in BufReader::new(stderr)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if let Some(progress) = line.strip_prefix("BXL_PROGRESS ") {
+                let mut values = progress.split_whitespace();
+                if let (Some(done), Some(total)) = (values.next(), values.next()) {
+                    eprintln!("BXL stats: {done}/{total} objects");
+                }
+            }
+        }
     });
     let output = child
         .wait_with_output()
         .context("wait for BXL statistics worker")?;
-    for line in stderr_reader.join().unwrap_or_default().lines() {
-        if let Some(progress) = line.strip_prefix("BXL_PROGRESS ") {
-            let mut values = progress.split_whitespace();
-            if let (Some(done), Some(total)) = (values.next(), values.next()) {
-                println!("BXL stats: {done}/{total} objects");
-            }
-        }
-    }
+    let _ = stderr_reader.join();
     if !output.status.success() {
         anyhow::bail!("BXL statistics worker failed with {}", output.status);
     }
