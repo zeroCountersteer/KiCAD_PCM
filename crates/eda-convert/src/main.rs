@@ -30,6 +30,7 @@ enum Command {
         all: bool,
     },
     BxlStats,
+    BxlStale,
     #[command(hide = true)]
     BxlStatsWorker,
     Kicad {
@@ -102,6 +103,7 @@ fn main() -> Result<()> {
             }
         }
         Command::BxlStats => stats(&c.data),
+        Command::BxlStale => bxl_stale(&c.data),
         Command::BxlStatsWorker => stats_worker(&c.data),
         Command::Kicad {
             mpn,
@@ -775,6 +777,57 @@ fn stats(data: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct StaleDerivedEntry {
+    path: String,
+    sha256: Option<String>,
+    mpn: Option<String>,
+}
+
+fn bxl_stale(data: &Path) -> Result<()> {
+    let expected = current_ti_component_paths(data)?;
+    let dir = data
+        .join("derived/components")
+        .join(safe("Texas Instruments"));
+    let mut entries = Vec::new();
+    for entry in walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+    {
+        if expected.contains(entry.path()) {
+            continue;
+        }
+        let component = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|json| serde_json::from_str::<EdaComponent>(&json).ok());
+        entries.push(StaleDerivedEntry {
+            path: entry.path().display().to_string(),
+            sha256: component.as_ref().and_then(|c| c.source_sha256.clone()),
+            mpn: component.map(|c| c.mpn),
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let reports = data.join("reports");
+    fs::create_dir_all(&reports)?;
+    fs::write(
+        reports.join("ti-bxl-stale-derived.json"),
+        format!("{}\n", serde_json::to_string_pretty(&entries)?),
+    )?;
+    let mut markdown = format!("# TI BXL stale derived components\n\nCount: {}\n\n| Path | SHA256 | MPN |\n|---|---|---|\n", entries.len());
+    for entry in &entries {
+        markdown.push_str(&format!(
+            "| `{}` | `{}` | `{}` |\n",
+            entry.path,
+            entry.sha256.as_deref().unwrap_or(""),
+            entry.mpn.as_deref().unwrap_or("")
+        ));
+    }
+    fs::write(reports.join("ti-bxl-stale-derived.md"), markdown)?;
+    println!("stale derived components: {}", entries.len());
+    Ok(())
+}
+
 fn stats_worker(data: &Path) -> Result<()> {
     let corpus = load_current_ti_bxl_corpus(data)?;
     let mut paths = corpus
@@ -843,13 +896,23 @@ fn kicad_generate(
     if let Some(p) = input {
         paths.push(p)
     } else {
+        let current_ti = if all && manufacturer.as_deref() == Some("ti") {
+            Some(current_ti_component_paths(data)?)
+        } else {
+            None
+        };
         let dir = data.join("derived/components");
         for e in walkdir::WalkDir::new(dir)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         {
-            paths.push(e.path().to_path_buf())
+            if current_ti
+                .as_ref()
+                .is_none_or(|expected| expected.contains(e.path()))
+            {
+                paths.push(e.path().to_path_buf())
+            }
         }
     }
     let mut cs = Vec::new();
@@ -1119,6 +1182,30 @@ fn load_components(data: &Path, manufacturer: Option<&str>) -> Result<Vec<EdaCom
         }
     }
     Ok(out)
+}
+
+fn current_ti_component_paths(data: &Path) -> Result<BTreeSet<PathBuf>> {
+    let corpus = load_current_ti_bxl_corpus(data)?;
+    let mut by_sha = BTreeMap::<String, Vec<eda_model::AssetRecord>>::new();
+    for asset in corpus.assets {
+        by_sha
+            .entry(asset.sha256)
+            .or_default()
+            .extend(asset.references);
+    }
+    Ok(by_sha
+        .into_values()
+        .map(|references| {
+            let primary = references
+                .iter()
+                .map(|r| r.mpn.as_str())
+                .min()
+                .unwrap_or("unknown");
+            data.join("derived/components")
+                .join(safe("Texas Instruments"))
+                .join(format!("{}.json", safe(primary)))
+        })
+        .collect())
 }
 fn find_package(data: &Path, wanted: &str) -> Result<package_normalize::NormalizedPackage> {
     for c in load_components(data, None)? {
