@@ -1039,6 +1039,16 @@ fn kicad_generate(
         fs::create_dir_all(&fpdir)?;
         for c in &items {
             for p in &c.packages {
+                if p.pads
+                    .iter()
+                    .any(|pad| pad.drill.is_some() && pad.plated.is_none())
+                {
+                    report.push_str(&format!(
+                        "* {} / {}: skipped production footprint; drill plating is unspecified\n",
+                        c.mpn, p.name
+                    ));
+                    continue;
+                }
                 if let Some(shape) = p.pads.iter().find_map(|pad| {
                     (!matches!(
                         pad.shape.to_ascii_lowercase().as_str(),

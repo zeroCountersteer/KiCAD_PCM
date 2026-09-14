@@ -25,6 +25,8 @@ pub struct NormalizedGraphic {
     pub layer: String,
     pub data: Vec<i64>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub width_nm: i64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Bounds {
@@ -74,6 +76,7 @@ pub struct DedupeResult {
     pub packages: Vec<NormalizedPackage>,
     pub canonical: Vec<CanonicalPackage>,
     pub physical_groups: BTreeMap<String, Vec<String>>,
+    pub manufacturing_groups: BTreeMap<String, Vec<String>>,
     pub warnings: Vec<String>,
 }
 
@@ -89,8 +92,14 @@ fn bounds(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> Bounds {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     for p in pads {
-        xs.extend([p.x_nm - p.width_nm / 2, p.x_nm + p.width_nm / 2]);
-        ys.extend([p.y_nm - p.height_nm / 2, p.y_nm + p.height_nm / 2]);
+        let quarter_turn = p.rotation_mdeg.rem_euclid(180000) == 90000;
+        let (width, height) = if quarter_turn {
+            (p.height_nm, p.width_nm)
+        } else {
+            (p.width_nm, p.height_nm)
+        };
+        xs.extend([p.x_nm - width / 2, p.x_nm + width / 2]);
+        ys.extend([p.y_nm - height / 2, p.y_nm + height / 2]);
     }
     for g in graphics {
         for xy in g.data.chunks(2) {
@@ -115,12 +124,16 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
         .iter()
         .map(|g| match g {
             Graphic::Line {
-                start, end, layer, ..
+                start,
+                end,
+                width_nm,
+                layer,
             } => NormalizedGraphic {
                 kind: "line".into(),
                 layer: layer.clone(),
                 data: vec![start.x_nm, start.y_nm, end.x_nm, end.y_nm],
                 text: None,
+                width_nm: *width_nm,
             },
             Graphic::Circle {
                 center,
@@ -132,6 +145,7 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                 layer: layer.clone(),
                 data: vec![center.x_nm, center.y_nm, *radius_nm],
                 text: None,
+                width_nm: 0,
             },
             Graphic::Rectangle {
                 start, end, layer, ..
@@ -140,12 +154,14 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                 layer: layer.clone(),
                 data: vec![start.x_nm, start.y_nm, end.x_nm, end.y_nm],
                 text: None,
+                width_nm: 0,
             },
             Graphic::Polygon { points, layer, .. } => NormalizedGraphic {
                 kind: "polygon".into(),
                 layer: layer.clone(),
                 data: points.iter().flat_map(|x| [x.x_nm, x.y_nm]).collect(),
                 text: None,
+                width_nm: 0,
             },
             Graphic::Arc {
                 center,
@@ -165,6 +181,7 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                     end.y_nm,
                 ],
                 text: None,
+                width_nm: 0,
             },
             Graphic::Text {
                 text,
@@ -176,6 +193,7 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                 layer: layer.clone(),
                 data: vec![position.x_nm, position.y_nm],
                 text: Some(text.clone()),
+                width_nm: 0,
             },
         })
         .collect()
@@ -186,8 +204,10 @@ fn pad(p: &Pad) -> NormalizedPad {
         kind: if p.drill.is_some() {
             if p.plated == Some(false) {
                 "np_thru_hole"
-            } else {
+            } else if p.plated == Some(true) {
                 "thru_hole"
+            } else {
+                "unknown_drill_plating"
             }
         } else {
             "smd"
@@ -223,14 +243,6 @@ fn transformed(
         p.x_nm = x;
         p.y_nm = y;
         p.rotation_mdeg = (p.rotation_mdeg + r).rem_euclid(360000);
-        if r == 90000 || r == 270000 {
-            std::mem::swap(&mut p.width_nm, &mut p.height_nm);
-        }
-        if let Some(d) = &mut p.drill {
-            if r == 90000 || r == 270000 {
-                std::mem::swap(&mut d.x_nm, &mut d.y_nm);
-            }
-        }
     }
     for g in &mut gs {
         for xy in g.data.chunks_mut(2).filter(|x| x.len() == 2) {
@@ -276,6 +288,66 @@ fn key(pads: &[NormalizedPad], gs: &[NormalizedGraphic], level: u8) -> String {
     }
     serde_json::to_string(&(ps, gg)).unwrap()
 }
+fn kicad_layer(layer: &str) -> String {
+    match layer.to_ascii_uppercase().as_str() {
+        "TOP_SILKSCREEN" => "F.SilkS",
+        "TOP_ASSEMBLY" => "F.Fab",
+        "TOP_COPPER" | "TOP" => "F.Cu",
+        "TOP_SOLDER_MASK" => "F.Mask",
+        "TOP_PASTE" => "F.Paste",
+        "BOTTOM_SILKSCREEN" => "B.SilkS",
+        "BOTTOM_ASSEMBLY" => "B.Fab",
+        "BOTTOM_COPPER" | "BOTTOM" => "B.Cu",
+        _ => layer,
+    }
+    .into()
+}
+fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> serde_json::Value {
+    let pads = pads
+        .iter()
+        .filter(|p| p.kind != "unknown_drill_plating")
+        .map(|p| {
+            let shape = match p.shape.as_str() {
+                "circle" => "circle",
+                "oval" => "oval",
+                "roundrect" => "roundrect",
+                "rectangle" | "rect" => "rect",
+                other => other,
+            };
+            let layers = if p.layers.is_empty() {
+                if p.kind == "smd" {
+                    vec!["F.Cu".into(), "F.Paste".into(), "F.Mask".into()]
+                } else {
+                    vec!["*.Cu".into(), "*.Mask".into()]
+                }
+            } else {
+                p.layers.iter().map(|x| kicad_layer(x)).collect()
+            };
+            serde_json::json!({
+                "number": p.number, "kind": p.kind, "shape": shape,
+                "x": p.x_nm, "y": p.y_nm, "rotation": p.rotation_mdeg,
+                "width": p.width_nm, "height": p.height_nm, "layers": layers,
+                "drill": p.drill.as_ref().map(|d| d.x_nm),
+            })
+        })
+        .collect::<Vec<_>>();
+    let graphics = graphics
+        .iter()
+        .filter(|g| g.kind == "line")
+        .map(|g| serde_json::json!({"data": g.data, "width": g.width_nm, "layer": kicad_layer(&g.layer)}))
+        .collect::<Vec<_>>();
+    serde_json::json!({"pads": pads, "graphics": graphics})
+}
+fn kicad_groups(packages: &[NormalizedPackage]) -> BTreeMap<String, Vec<String>> {
+    let mut groups = BTreeMap::new();
+    for p in packages {
+        groups
+            .entry(p.fingerprints.kicad_footprint_hash.clone())
+            .or_insert_with(Vec::new)
+            .push(format!("{}:{}", p.source.mpn, p.source.name));
+    }
+    groups
+}
 pub fn normalize_package(c: &EdaComponent, p: &Package) -> NormalizedPackage {
     let raw = p.pads.iter().map(pad).collect::<Vec<_>>();
     let rawg = graphics(p);
@@ -304,7 +376,7 @@ pub fn normalize_package(c: &EdaComponent, p: &Package) -> NormalizedPackage {
         electrical_geometry_hash: hash(&fingerprint(2)),
         manufacturing_hash: hash(&fingerprint(3)),
         full_geometry_hash: hash(&fingerprint(4)),
-        kicad_footprint_hash: hash(&fingerprint(4)),
+        kicad_footprint_hash: hash(&kicad_projection(&pads, &graphics)),
     };
     let mut warnings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -379,10 +451,10 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
     }
     let mut used = BTreeSet::new();
     let mut canonical = Vec::new();
-    for (h, names) in &manufacturing_groups {
+    for (h, names) in &kicad_groups(&packages) {
         let ix = packages
             .iter()
-            .position(|p| p.fingerprints.manufacturing_hash == *h)
+            .position(|p| p.fingerprints.kicad_footprint_hash == *h)
             .unwrap();
         let mut aliases = names.clone();
         aliases.sort();
@@ -392,7 +464,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
             aliases,
             sources: packages
                 .iter()
-                .filter(|p| p.fingerprints.manufacturing_hash == *h)
+                .filter(|p| p.fingerprints.kicad_footprint_hash == *h)
                 .map(|p| p.source.clone())
                 .collect(),
             representative: packages[ix].clone(),
@@ -403,6 +475,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
         packages,
         canonical,
         physical_groups,
+        manufacturing_groups,
         warnings: Vec::new(),
     }
 }
@@ -509,5 +582,106 @@ mod tests {
             g.fingerprints.full_geometry_hash,
             b.fingerprints.full_geometry_hash
         );
+    }
+
+    #[test]
+    fn rectangular_pad_rotation_does_not_swap_local_dimensions_or_drill() {
+        let p = NormalizedPad {
+            number: "1".into(),
+            kind: "thru_hole".into(),
+            shape: "rect".into(),
+            x_nm: 0,
+            y_nm: 0,
+            width_nm: 1000,
+            height_nm: 2000,
+            rotation_mdeg: 0,
+            drill: Some(Point {
+                x_nm: 300,
+                y_nm: 500,
+            }),
+            plated: Some(true),
+            layers: Vec::new(),
+            mask_nm: None,
+            paste: None,
+        };
+        let (pads, _, _) = transformed(vec![p], Vec::new(), 90000, false);
+        assert_eq!((pads[0].width_nm, pads[0].height_nm), (1000, 2000));
+        assert_eq!(
+            pads[0].drill,
+            Some(Point {
+                x_nm: 300,
+                y_nm: 500
+            })
+        );
+    }
+
+    #[test]
+    fn rect_and_rectangle_share_kicad_identity() {
+        let mut a = p("1", 0);
+        let mut b = a.clone();
+        a.shape = "rect".into();
+        b.shape = "rectangle".into();
+        let ca = normalize_package(&c(vec![a.clone()]), &c(vec![a]).packages[0]);
+        let cb = normalize_package(&c(vec![b.clone()]), &c(vec![b]).packages[0]);
+        assert_eq!(
+            ca.fingerprints.kicad_footprint_hash,
+            cb.fingerprints.kicad_footprint_hash
+        );
+    }
+
+    #[test]
+    fn dedupe_uses_kicad_groups_separately_from_manufacturing_groups() {
+        let mut a = p("1", 0);
+        let mut b = a.clone();
+        a.paste = Some(true);
+        b.paste = Some(false);
+        let mut ca = c(vec![a]);
+        let mut cb = c(vec![b]);
+        ca.mpn = "A".into();
+        cb.mpn = "B".into();
+        let result = dedupe(&[ca, cb]);
+        assert_eq!(result.canonical.len(), 1);
+        assert_eq!(result.manufacturing_groups.len(), 2);
+    }
+
+    #[test]
+    fn manufacturing_match_does_not_collapse_different_emitted_graphics() {
+        let mut a = c(vec![p("1", 0)]);
+        let mut b = a.clone();
+        a.mpn = "A".into();
+        b.mpn = "B".into();
+        a.packages[0].graphics.push(Graphic::Line {
+            start: Point { x_nm: 0, y_nm: 0 },
+            end: Point {
+                x_nm: 1000,
+                y_nm: 0,
+            },
+            width_nm: 10,
+            layer: "TOP_SILKSCREEN".into(),
+        });
+        b.packages[0].graphics.push(Graphic::Line {
+            start: Point { x_nm: 0, y_nm: 0 },
+            end: Point {
+                x_nm: 2000,
+                y_nm: 0,
+            },
+            width_nm: 10,
+            layer: "TOP_SILKSCREEN".into(),
+        });
+        let result = dedupe(&[a, b]);
+        assert_eq!(result.manufacturing_groups.len(), 1);
+        assert_eq!(result.canonical.len(), 2);
+    }
+
+    #[test]
+    fn unknown_drill_plating_is_not_classified_as_plated() {
+        let mut drilled = p("1", 0);
+        drilled.drill = Some(Point {
+            x_nm: 300,
+            y_nm: 300,
+        });
+        let component = c(vec![drilled]);
+        let normalized = normalize_package(&component, &component.packages[0]);
+        assert_eq!(normalized.pads[0].kind, "unknown_drill_plating");
     }
 }

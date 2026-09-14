@@ -70,6 +70,12 @@ pub fn validate(c: &EdaComponent) -> Validation {
     for p in &c.packages {
         let mut seen = BTreeSet::new();
         for x in &p.pads {
+            if x.drill.is_some() && x.plated.is_none() {
+                v.errors.push(format!(
+                    "{} pad {}: drill plating is unspecified",
+                    p.name, x.number
+                ));
+            }
             if x.number.trim().is_empty() {
                 v.errors.push(format!("{}: blank pad", p.name))
             }
@@ -215,7 +221,10 @@ pub fn footprint(_c: &EdaComponent, p: &Package) -> String {
     footprint_with_model(_c, p, None)
 }
 pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>) -> String {
-    let has_through_hole = p.pads.iter().any(|pad| pad.drill.is_some());
+    let has_through_hole = p
+        .pads
+        .iter()
+        .any(|pad| pad.drill.is_some() && pad.plated.is_some());
     let mut o = format!(
         "(footprint \"{}\" (version {}) (generator pcbnew)\n  (layer \"F.Cu\")\n",
         name(&p.name),
@@ -239,6 +248,13 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         }
     }
     for x in &p.pads {
+        if x.drill.is_some() && x.plated.is_none() {
+            o.push_str(&format!(
+                "  (fp_text user \"UNSUPPORTED: unknown drill plating for pad {}\" (at 0 0 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n",
+                esc(&x.number)
+            ));
+            continue;
+        }
         let kind = if x.drill.is_some() {
             if x.plated == Some(false) {
                 "np_thru_hole"
@@ -267,7 +283,7 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
             "circle" => "circle",
             "oval" => "oval",
             "roundrect" => "roundrect",
-            "rectangle" => "rect",
+            "rectangle" | "rect" => "rect",
             _ => "custom",
         };
         let drill = x
@@ -355,6 +371,7 @@ mod tests {
                     x_nm: 800_000,
                     y_nm: 800_000,
                 }),
+                plated: Some(true),
                 ..Default::default()
             }],
             ..Default::default()
@@ -363,5 +380,29 @@ mod tests {
         assert!(!out.contains("(attr smd)"));
         assert!(out.contains("np_thru_hole") || out.contains("thru_hole"));
         assert!(out.contains("(drill 0.8)"));
+    }
+
+    #[test]
+    fn unknown_drill_plating_is_marked_and_not_emitted_as_through_hole() {
+        let package = Package {
+            name: "UNKNOWN".into(),
+            pads: vec![eda_model::Pad {
+                number: "1".into(),
+                shape: "rect".into(),
+                size: eda_model::Point {
+                    x_nm: 1_000_000,
+                    y_nm: 1_000_000,
+                },
+                drill: Some(eda_model::Point {
+                    x_nm: 500_000,
+                    y_nm: 500_000,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = footprint(&EdaComponent::default(), &package);
+        assert!(out.contains("UNSUPPORTED: unknown drill plating"));
+        assert!(!out.contains("thru_hole"));
     }
 }
