@@ -147,7 +147,7 @@ fn convert(
     let manufacturer = manufacturer.unwrap_or_else(|| "Unknown".into());
     let mpn = mpn.unwrap_or_else(|| input.file_stem().unwrap().to_string_lossy().into());
     let c = bxl_parser::canonicalize(&doc, &manufacturer, &mpn, Some(hash));
-    write_component(c, &input, data, references)
+    write_component(c, &input, data, references).map(|_| ())
 }
 
 fn write_component(
@@ -155,8 +155,11 @@ fn write_component(
     input: &Path,
     data: &Path,
     references: Option<&[eda_model::AssetRecord]>,
-) -> Result<()> {
+) -> Result<bool> {
     c.canonicalizer_version = bxl_parser::BXL_CANONICALIZER_VERSION.into();
+    let provenance_hash = references.map(provenance_hash).unwrap_or_default();
+    c.metadata
+        .insert("provenance_hash".into(), provenance_hash.clone());
     if let Some(references) = references {
         let mut mpns = references.iter().map(|r| r.mpn.clone()).collect::<Vec<_>>();
         mpns.sort();
@@ -207,25 +210,33 @@ fn write_component(
         .join(safe(&c.manufacturer))
         .join(format!("{}.json", safe(&c.mpn)));
     if let Ok(existing) = fs::read_to_string(&out) {
-        if existing.contains("\"pin_map\"")
-            && existing.contains(&format!(
-                "\"canonicalizer_version\": \"{}\"",
-                bxl_parser::BXL_CANONICALIZER_VERSION
-            ))
-            && existing.contains(&format!(
-                "\"source_sha256\": \"{}\"",
-                c.source_sha256.as_deref().unwrap_or_default()
-            ))
-            && (references.is_none() || existing.contains("\"associated_mpns\""))
-        {
-            return Ok(());
+        if let Ok(existing) = serde_json::from_str::<EdaComponent>(&existing) {
+            if existing.source_sha256 == c.source_sha256
+                && existing.canonicalizer_version == c.canonicalizer_version
+                && existing.metadata.get("provenance_hash") == Some(&provenance_hash)
+            {
+                return Ok(false);
+            }
         }
     }
     fs::create_dir_all(out.parent().unwrap())?;
     let json = serde_json::to_string_pretty(&c)?;
     fs::write(&out, format!("{json}\n"))?;
     println!("{} -> {}", input.display(), out.display());
-    Ok(())
+    Ok(true)
+}
+
+fn provenance_hash(references: &[eda_model::AssetRecord]) -> String {
+    let mut records = references.to_vec();
+    records.sort_by(|a, b| {
+        serde_json::to_string(a)
+            .unwrap_or_default()
+            .cmp(&serde_json::to_string(b).unwrap_or_default())
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&records).unwrap())
+    )
 }
 fn resolve_mpn(data: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
     let Some(wanted) = wanted else {
@@ -258,38 +269,205 @@ fn batch(data: &Path) -> Result<()> {
             .or_insert_with(|| (asset.object_path.clone(), Vec::new()));
         entry.1.extend(asset.references.clone());
     }
-    let unique_shas = by_sha.len();
-    let mut parsed: BTreeMap<String, std::result::Result<bxl_model::BxlDocument, String>> =
-        BTreeMap::new();
-    let mut converted = 0;
-    let mut parse_failures = 0;
-    for (sha, (path, references)) in by_sha {
-        let result = parsed.entry(sha.clone()).or_insert_with(|| {
-            fs::read(&path)
-                .and_then(|bytes| bxl_parser::parse(&bytes).map_err(std::io::Error::other))
-                .map_err(|e| e.to_string())
+    let mut plans = Vec::new();
+    for (sha, (path, mut references)) in by_sha {
+        references.sort_by(|a, b| {
+            serde_json::to_string(a)
+                .unwrap()
+                .cmp(&serde_json::to_string(b).unwrap())
         });
-        let doc = match result {
-            Ok(doc) => doc,
-            Err(error) => {
-                eprintln!("{}: {}", path.display(), error);
-                parse_failures += 1;
-                continue;
-            }
-        };
         let primary = references
             .iter()
             .map(|r| r.mpn.as_str())
             .min()
-            .unwrap_or("unknown");
-        let mut c = bxl_parser::canonicalize(doc, "Texas Instruments", primary, Some(sha));
-        c.canonicalizer_version = bxl_parser::BXL_CANONICALIZER_VERSION.into();
-        write_component(c, &path, data, Some(&references))?;
-        converted += 1;
+            .unwrap_or("unknown")
+            .to_owned();
+        let output = data
+            .join("derived/components")
+            .join(safe("Texas Instruments"))
+            .join(format!("{}.json", safe(&primary)));
+        let provenance_hash = provenance_hash(&references);
+        plans.push(ConversionPlan {
+            sha,
+            path,
+            references,
+            primary,
+            output,
+            provenance_hash,
+        });
     }
-    println!("BXL conversion\n\nCurrent observations       {}\nCurrent unique URLs         {}\nCurrent unique SHAs         {}\nCanonical components        {}\nParse failures              {}\nMissing URLs                 {}\nType mismatches              {}\nAmbiguous URLs               {}\nHistorical BXL URLs not current {}",
-        corpus.observations, corpus.unique_urls, unique_shas, converted, parse_failures,
-        corpus.missing_urls.len(), corpus.type_mismatches.len(), corpus.ambiguous_urls.len(), corpus.historical_bxl_urls.len());
+    plans.sort_by(|a, b| a.sha.cmp(&b.sha));
+    let collisions = output_collisions(&plans);
+    let mut report = ConversionReport {
+        observations: corpus.observations,
+        urls: corpus.unique_urls,
+        shas: plans.len(),
+        ..Default::default()
+    };
+    report.missing = corpus.missing_urls.len();
+    report.type_mismatches = corpus.type_mismatches.len();
+    report.ambiguous = corpus.ambiguous_urls.len();
+    report.output_collisions = collisions.len();
+    report.stale_derived_files = stale_derived_files(data, &plans)?;
+    if !collisions.is_empty() {
+        report.failure_count =
+            report.missing + report.type_mismatches + report.ambiguous + report.output_collisions;
+        write_conversion_report(data, &report, &collisions)?;
+        anyhow::bail!(
+            "BXL conversion has {} output collision(s); no components written",
+            collisions.len()
+        );
+    }
+    let parsed = parse_bxl_documents(&plans);
+    for plan in &plans {
+        let doc = match parsed.get(&plan.sha).expect("planned SHA has parse result") {
+            Ok(doc) => doc,
+            Err(error) => {
+                eprintln!("{}: {}", plan.path.display(), error);
+                report.parse_failures += 1;
+                continue;
+            }
+        };
+        let mut c = bxl_parser::canonicalize(
+            doc,
+            "Texas Instruments",
+            &plan.primary,
+            Some(plan.sha.clone()),
+        );
+        c.canonicalizer_version = bxl_parser::BXL_CANONICALIZER_VERSION.into();
+        if write_component(c, &plan.path, data, Some(&plan.references))? {
+            report.written += 1;
+        } else {
+            report.reused += 1;
+        }
+    }
+    report.failure_count = report.parse_failures
+        + report.missing
+        + report.type_mismatches
+        + report.ambiguous
+        + report.output_collisions;
+    write_conversion_report(data, &report, &[])?;
+    println!("{}", report.to_markdown());
+    if report.failure_count != 0 {
+        anyhow::bail!(
+            "BXL conversion completed with {} failure(s)",
+            report.failure_count
+        );
+    }
+    Ok(())
+}
+
+fn parse_bxl_documents(
+    plans: &[ConversionPlan],
+) -> BTreeMap<String, std::result::Result<bxl_model::BxlDocument, String>> {
+    let mut parsed = BTreeMap::new();
+    for plan in plans {
+        parsed.entry(plan.sha.clone()).or_insert_with(|| {
+            fs::read(&plan.path)
+                .and_then(|bytes| bxl_parser::parse(&bytes).map_err(std::io::Error::other))
+                .map_err(|e| e.to_string())
+        });
+    }
+    parsed
+}
+
+#[derive(Clone)]
+struct ConversionPlan {
+    sha: String,
+    path: PathBuf,
+    references: Vec<eda_model::AssetRecord>,
+    primary: String,
+    output: PathBuf,
+    provenance_hash: String,
+}
+
+fn output_collisions(plans: &[ConversionPlan]) -> Vec<String> {
+    let mut owners = BTreeMap::<&Path, &str>::new();
+    let mut collisions = BTreeSet::new();
+    for plan in plans {
+        if let Some(previous) = owners.insert(&plan.output, &plan.sha) {
+            if previous != plan.sha {
+                collisions.insert(plan.output.display().to_string());
+            }
+        }
+    }
+    collisions.into_iter().collect()
+}
+
+#[derive(Default, serde::Serialize)]
+struct ConversionReport {
+    observations: usize,
+    urls: usize,
+    shas: usize,
+    written: usize,
+    reused: usize,
+    parse_failures: usize,
+    missing: usize,
+    type_mismatches: usize,
+    ambiguous: usize,
+    output_collisions: usize,
+    stale_derived_files: usize,
+    failure_count: usize,
+}
+
+impl ConversionReport {
+    fn to_markdown(&self) -> String {
+        format!("# TI BXL conversion\n\n| Metric | Count |\n|---|---:|\n| Observations | {} |\n| URLs | {} |\n| SHAs | {} |\n| Written | {} |\n| Reused | {} |\n| Parse failures | {} |\n| Missing | {} |\n| Type mismatches | {} |\n| Ambiguous | {} |\n| Output collisions | {} |\n| Stale derived files | {} |\n| Failures | {} |\n", self.observations, self.urls, self.shas, self.written, self.reused, self.parse_failures, self.missing, self.type_mismatches, self.ambiguous, self.output_collisions, self.stale_derived_files, self.failure_count)
+    }
+}
+
+fn stale_derived_files(data: &Path, plans: &[ConversionPlan]) -> Result<usize> {
+    let expected = plans
+        .iter()
+        .map(|p| p.output.clone())
+        .collect::<BTreeSet<_>>();
+    let dir = data
+        .join("derived/components")
+        .join(safe("Texas Instruments"));
+    let mut count = 0;
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.path().extension().is_some_and(|x| x == "json") && !expected.contains(entry.path())
+        {
+            count += 1;
+        }
+    }
+    count += plans
+        .iter()
+        .filter(|p| p.output.exists() && !cache_matches(&p.output, &p.sha, &p.provenance_hash))
+        .count();
+    Ok(count)
+}
+
+fn cache_matches(path: &Path, sha: &str, provenance: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<EdaComponent>(&s).ok())
+        .is_some_and(|c| {
+            c.source_sha256.as_deref() == Some(sha)
+                && c.canonicalizer_version == bxl_parser::BXL_CANONICALIZER_VERSION
+                && c.metadata
+                    .get("provenance_hash")
+                    .is_some_and(|x| x == provenance)
+        })
+}
+
+fn write_conversion_report(
+    data: &Path,
+    report: &ConversionReport,
+    collisions: &[String],
+) -> Result<()> {
+    let dir = data.join("reports");
+    fs::create_dir_all(&dir)?;
+    let mut json = serde_json::to_value(report)?;
+    json["collision_paths"] = serde_json::json!(collisions);
+    fs::write(
+        dir.join("ti-bxl-conversion.json"),
+        format!("{}\n", serde_json::to_string_pretty(&json)?),
+    )?;
+    fs::write(dir.join("ti-bxl-conversion.md"), report.to_markdown())?;
     Ok(())
 }
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -456,7 +634,7 @@ fn stats(data: &Path) -> Result<()> {
         .arg(data)
         .arg("bxl-stats-worker")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .output()
         .context("run quiet BXL statistics worker")?;
     if !output.status.success() {
@@ -502,7 +680,12 @@ fn stats_worker(data: &Path) -> Result<()> {
     paths.sort();
     paths.dedup();
     let mut result = BxlStatsResult::default();
-    for path in paths {
+    let total = paths.len();
+    eprintln!("BXL stats: processing {total} current SHA objects");
+    for (index, path) in paths.into_iter().enumerate() {
+        if index == 0 || (index + 1) % 100 == 0 || index + 1 == total {
+            eprintln!("BXL stats: {}/{} objects", index + 1, total);
+        }
         result.objects_processed += 1;
         let bytes = fs::read(&path)?;
         result.compressed_bytes += bytes.len() as u64;
@@ -1189,6 +1372,173 @@ fn model_info(data: &Path, query: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::fs;
+
+    fn sha(ch: char) -> String {
+        std::iter::repeat_n(ch, 64).collect()
+    }
+    fn row(url: &str, mpn: &str) -> serde_json::Value {
+        serde_json::json!({"part_number":mpn,"description":null,"functionality":null,"status":null,"automotive":null,"package_code":"DIP","pin_count":8,"bxl_available":true,"step_available":false,"product_url":format!("https://ti.com/{mpn}"),"bxl_url":url,"step_url":null,"package_pitch":null,"package_height":null,"package_length":null,"package_width":null,"source":"test"})
+    }
+    fn manifest(url: &str, hash: &str) -> serde_json::Value {
+        serde_json::json!({"manufacturer":"Texas Instruments","mpn":"TEST","part_url":"https://ti.com/TEST","asset_url":url,"discovery_url":null,"filename":"TEST.bxl","format":"bxl","sha256":hash,"size":1,"retrieved_at":"2026-01-01T00:00:00Z","http_etag":null,"http_last_modified":null,"content_type":null,"source_package":null,"request_url":null,"final_download_url":null,"content_disposition_filename":null})
+    }
+    fn fixture(
+        rows: Vec<serde_json::Value>,
+        manifests: Vec<serde_json::Value>,
+        objects: &[&str],
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("catalogs/ti-bxl")).unwrap();
+        fs::create_dir_all(dir.path().join("manifests")).unwrap();
+        fs::write(
+            dir.path().join("catalogs/ti-bxl/current.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("manifests/texas-instruments.jsonl"),
+            manifests
+                .iter()
+                .map(|m| serde_json::to_string(m).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        for hash in objects {
+            let path = dir.path().join("objects").join(&hash[..2]);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(format!("{hash}.bxl")), b"object").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn current_loader_excludes_historical_and_groups_shared_sha() {
+        let current = "https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/CURRENT.bxl";
+        let current_alias = "https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/CURRENT_ALIAS.bxl";
+        let historical = "https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/HISTORICAL.bxl";
+        let hash = sha('a');
+        let dir = fixture(
+            vec![
+                row(current, "A"),
+                row(current, "B"),
+                row(current_alias, "C"),
+            ],
+            vec![
+                manifest(current, &hash),
+                manifest(current_alias, &hash),
+                manifest(historical, &sha('b')),
+            ],
+            &[&hash, &sha('b')],
+        );
+        let corpus = load_current_ti_bxl_corpus(dir.path()).unwrap();
+        assert_eq!(corpus.unique_urls, 2);
+        assert_eq!(corpus.observations, 3);
+        assert_eq!(corpus.assets.len(), 2);
+        assert_eq!(
+            corpus
+                .assets
+                .iter()
+                .map(|a| &a.sha256)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(corpus.historical_bxl_urls, vec![historical]);
+    }
+
+    #[test]
+    fn loader_reports_multiple_shas_and_missing_object() {
+        let ambiguous = "https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/A.bxl";
+        let missing = "https://webench.ti.com/cad/dlbxl.cgi/TI_BXL/M.bxl";
+        let dir = fixture(
+            vec![row(ambiguous, "A"), row(missing, "M")],
+            vec![
+                manifest(ambiguous, &sha('a')),
+                manifest(ambiguous, &sha('b')),
+                manifest(missing, &sha('c')),
+            ],
+            &[],
+        );
+        let corpus = load_current_ti_bxl_corpus(dir.path()).unwrap();
+        assert_eq!(corpus.ambiguous_urls, vec![ambiguous]);
+        assert_eq!(corpus.missing_urls, vec![missing]);
+    }
+
+    #[test]
+    fn shared_sha_is_parsed_once_and_collision_is_detected() {
+        let hash = sha('a');
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object.bxl");
+        fs::write(&path, b"bad").unwrap();
+        let refs = vec![eda_model::AssetRecord {
+            manufacturer: "TI".into(),
+            mpn: "B".into(),
+            part_url: "p".into(),
+            asset_url: "a".into(),
+            discovery_url: None,
+            filename: "a".into(),
+            format: "bxl".into(),
+            content_type: None,
+            source_package: None,
+            request_url: None,
+        }];
+        let plans = vec![
+            ConversionPlan {
+                sha: hash.clone(),
+                path: path.clone(),
+                references: refs.clone(),
+                primary: "B".into(),
+                output: dir.path().join("same.json"),
+                provenance_hash: provenance_hash(&refs),
+            },
+            ConversionPlan {
+                sha: hash.clone(),
+                path,
+                references: refs.clone(),
+                primary: "B".into(),
+                output: dir.path().join("same.json"),
+                provenance_hash: provenance_hash(&refs),
+            },
+        ];
+        assert_eq!(parse_bxl_documents(&plans).len(), 1);
+        let mut second = plans[0].clone();
+        second.sha = sha('b');
+        assert_eq!(output_collisions(&[plans[0].clone(), second]).len(), 1);
+    }
+
+    #[test]
+    fn provenance_and_version_are_required_for_cache_reuse() {
+        let refs = vec![eda_model::AssetRecord {
+            manufacturer: "TI".into(),
+            mpn: "A".into(),
+            part_url: "p".into(),
+            asset_url: "a".into(),
+            discovery_url: None,
+            filename: "a".into(),
+            format: "bxl".into(),
+            content_type: None,
+            source_package: None,
+            request_url: None,
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.json");
+        let mut c = EdaComponent {
+            source_sha256: Some(sha('a')),
+            canonicalizer_version: bxl_parser::BXL_CANONICALIZER_VERSION.into(),
+            ..Default::default()
+        };
+        c.metadata
+            .insert("provenance_hash".into(), provenance_hash(&refs));
+        fs::write(&path, serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(cache_matches(&path, &sha('a'), &provenance_hash(&refs)));
+        assert!(!cache_matches(&path, &sha('a'), "changed"));
+        c.canonicalizer_version = "old-version".into();
+        fs::write(&path, serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(!cache_matches(&path, &sha('a'), &provenance_hash(&refs)));
+    }
+
     #[test]
     fn decoded_bxl_to_kicad_preserves_through_hole_drill() {
         let doc = bxl_model::BxlDocument {
