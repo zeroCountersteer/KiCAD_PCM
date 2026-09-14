@@ -265,42 +265,7 @@ fn resolve_mpn(data: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
 }
 fn batch(data: &Path) -> Result<()> {
     let corpus = load_current_ti_bxl_corpus(data)?;
-    let mut by_sha: BTreeMap<String, (PathBuf, Vec<eda_model::AssetRecord>)> = BTreeMap::new();
-    for asset in &corpus.assets {
-        debug_assert_eq!(asset.sha256, asset.manifest.sha256);
-        let entry = by_sha
-            .entry(asset.sha256.clone())
-            .or_insert_with(|| (asset.object_path.clone(), Vec::new()));
-        entry.1.extend(asset.references.clone());
-    }
-    let mut plans = Vec::new();
-    for (sha, (path, mut references)) in by_sha {
-        references.sort_by(|a, b| {
-            serde_json::to_string(a)
-                .unwrap()
-                .cmp(&serde_json::to_string(b).unwrap())
-        });
-        let primary = references
-            .iter()
-            .map(|r| r.mpn.as_str())
-            .min()
-            .unwrap_or("unknown")
-            .to_owned();
-        let output = data
-            .join("derived/components")
-            .join(safe("Texas Instruments"))
-            .join(format!("{}.json", safe(&primary)));
-        let provenance_hash = provenance_hash(&references);
-        plans.push(ConversionPlan {
-            sha,
-            path,
-            references,
-            primary,
-            output,
-            provenance_hash,
-        });
-    }
-    plans.sort_by(|a, b| a.sha.cmp(&b.sha));
+    let plans = conversion_plans(data, &corpus);
     let collisions = output_collisions(&plans);
     let mut report = ConversionReport {
         observations: corpus.observations,
@@ -411,6 +376,48 @@ struct ConversionPlan {
     primary: String,
     output: PathBuf,
     provenance_hash: String,
+}
+
+fn conversion_plans(data: &Path, corpus: &CurrentBxlCorpus) -> Vec<ConversionPlan> {
+    let mut by_sha: BTreeMap<String, (PathBuf, Vec<eda_model::AssetRecord>)> = BTreeMap::new();
+    for asset in &corpus.assets {
+        debug_assert_eq!(asset.sha256, asset.manifest.sha256);
+        let entry = by_sha
+            .entry(asset.sha256.clone())
+            .or_insert_with(|| (asset.object_path.clone(), Vec::new()));
+        entry.1.extend(asset.references.clone());
+    }
+    let mut plans = by_sha
+        .into_iter()
+        .map(|(sha, (path, mut references))| {
+            references.sort_by(|a, b| {
+                serde_json::to_string(a)
+                    .unwrap()
+                    .cmp(&serde_json::to_string(b).unwrap())
+            });
+            let primary = references
+                .iter()
+                .map(|r| r.mpn.as_str())
+                .min()
+                .unwrap_or("unknown")
+                .to_owned();
+            let output = data
+                .join("derived/components")
+                .join(safe("Texas Instruments"))
+                .join(format!("{}.json", safe(&primary)));
+            let provenance_hash = provenance_hash(&references);
+            ConversionPlan {
+                sha,
+                path,
+                references,
+                primary,
+                output,
+                provenance_hash,
+            }
+        })
+        .collect::<Vec<_>>();
+    plans.sort_by(|a, b| a.sha.cmp(&b.sha));
+    plans
 }
 
 fn output_collisions(plans: &[ConversionPlan]) -> Vec<String> {
@@ -777,15 +784,26 @@ fn stats(data: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct StaleDerivedEntry {
     path: String,
     sha256: Option<String>,
     mpn: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+struct StaleDerivedInventory {
+    missing_expected: Vec<String>,
+    stale_extra: Vec<StaleDerivedEntry>,
+}
+
 fn bxl_stale(data: &Path) -> Result<()> {
     let expected = current_ti_component_paths(data)?;
+    let missing_expected = expected
+        .iter()
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
     let dir = data
         .join("derived/components")
         .join(safe("Texas Instruments"));
@@ -812,9 +830,15 @@ fn bxl_stale(data: &Path) -> Result<()> {
     fs::create_dir_all(&reports)?;
     fs::write(
         reports.join("ti-bxl-stale-derived.json"),
-        format!("{}\n", serde_json::to_string_pretty(&entries)?),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&StaleDerivedInventory {
+                missing_expected: missing_expected.clone(),
+                stale_extra: entries.clone(),
+            })?
+        ),
     )?;
-    let mut markdown = format!("# TI BXL stale derived components\n\nCount: {}\n\n| Path | SHA256 | MPN |\n|---|---|---|\n", entries.len());
+    let mut markdown = format!("# TI BXL derived component inventory\n\nMissing expected: {}\n\nStale extra: {}\n\n## Stale extra\n\n| Path | SHA256 | MPN |\n|---|---|---|\n", missing_expected.len(), entries.len());
     for entry in &entries {
         markdown.push_str(&format!(
             "| `{}` | `{}` | `{}` |\n",
@@ -822,6 +846,12 @@ fn bxl_stale(data: &Path) -> Result<()> {
             entry.sha256.as_deref().unwrap_or(""),
             entry.mpn.as_deref().unwrap_or("")
         ));
+    }
+    if !missing_expected.is_empty() {
+        markdown.push_str("\n## Missing expected\n\n");
+        for path in &missing_expected {
+            markdown.push_str(&format!("* `{path}`\n"));
+        }
     }
     fs::write(reports.join("ti-bxl-stale-derived.md"), markdown)?;
     println!("stale derived components: {}", entries.len());
@@ -895,24 +925,27 @@ fn kicad_generate(
     let mut paths = Vec::new();
     if let Some(p) = input {
         paths.push(p)
+    } else if all && manufacturer.as_deref() == Some("ti") {
+        let expected = current_ti_component_paths(data)?;
+        let missing = expected
+            .iter()
+            .filter(|path| !path.is_file())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "{} current TI derived component(s) are missing",
+                missing.len()
+            );
+        }
+        paths.extend(expected);
     } else {
-        let current_ti = if all && manufacturer.as_deref() == Some("ti") {
-            Some(current_ti_component_paths(data)?)
-        } else {
-            None
-        };
         let dir = data.join("derived/components");
         for e in walkdir::WalkDir::new(dir)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         {
-            if current_ti
-                .as_ref()
-                .is_none_or(|expected| expected.contains(e.path()))
-            {
-                paths.push(e.path().to_path_buf())
-            }
+            paths.push(e.path().to_path_buf())
         }
     }
     let mut cs = Vec::new();
@@ -1186,25 +1219,9 @@ fn load_components(data: &Path, manufacturer: Option<&str>) -> Result<Vec<EdaCom
 
 fn current_ti_component_paths(data: &Path) -> Result<BTreeSet<PathBuf>> {
     let corpus = load_current_ti_bxl_corpus(data)?;
-    let mut by_sha = BTreeMap::<String, Vec<eda_model::AssetRecord>>::new();
-    for asset in corpus.assets {
-        by_sha
-            .entry(asset.sha256)
-            .or_default()
-            .extend(asset.references);
-    }
-    Ok(by_sha
-        .into_values()
-        .map(|references| {
-            let primary = references
-                .iter()
-                .map(|r| r.mpn.as_str())
-                .min()
-                .unwrap_or("unknown");
-            data.join("derived/components")
-                .join(safe("Texas Instruments"))
-                .join(format!("{}.json", safe(primary)))
-        })
+    Ok(conversion_plans(data, &corpus)
+        .into_iter()
+        .map(|plan| plan.output)
         .collect())
 }
 fn find_package(data: &Path, wanted: &str) -> Result<package_normalize::NormalizedPackage> {
