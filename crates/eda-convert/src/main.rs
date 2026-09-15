@@ -989,51 +989,13 @@ fn kicad_generate(
         by_m.entry(safe(&c.manufacturer)).or_default().push(c)
     }
     let manufacturer_count = by_m.len();
+    let all_components = by_m.values().flatten().cloned().collect::<Vec<_>>();
     let dedupe = if deduplicated {
-        Some(package_normalize::dedupe(
-            &by_m.values().flatten().cloned().collect::<Vec<_>>(),
-        ))
+        Some(package_normalize::dedupe(&all_components))
     } else {
         None
     };
-    let eligible_keys = by_m
-        .values()
-        .flatten()
-        .flat_map(|c| {
-            c.packages
-                .iter()
-                .filter(|p| {
-                    matches!(
-                        eda_model::footprint_eligibility(p),
-                        eda_model::FootprintEligibility::Eligible
-                    )
-                })
-                .map(|p| format!("{}|{}|{}", c.manufacturer, c.mpn, p.name))
-        })
-        .collect::<BTreeSet<_>>();
-    let footprint_map = dedupe
-        .as_ref()
-        .map(|d| {
-            let mut m = std::collections::BTreeMap::new();
-            for p in &d.packages {
-                let key = format!(
-                    "{}|{}|{}",
-                    p.source.manufacturer, p.source.mpn, p.source.name
-                );
-                if !eligible_keys.contains(&key) {
-                    continue;
-                }
-                if let Some(g) = d.canonical.iter().find(|g| {
-                    g.fingerprints.kicad_footprint_hash.is_some()
-                        && g.fingerprints.kicad_footprint_hash
-                            == p.fingerprints.kicad_footprint_hash
-                }) {
-                    m.insert(key, safe(&g.preferred_name));
-                }
-            }
-            m
-        })
-        .unwrap_or_default();
+    let footprint_map = production_footprint_map(&all_components, dedupe.as_ref())?;
     for (man, items) in by_m {
         let symdir = root.join("symbols");
         fs::create_dir_all(&symdir)?;
@@ -1068,15 +1030,22 @@ fn kicad_generate(
                         continue;
                     }
                 }
-                let out_name = dedupe
-                    .as_ref()
-                    .and_then(|d| {
-                        d.packages
-                            .iter()
-                            .find(|x| x.source.mpn == c.mpn && x.source.name == p.name)
-                    })
-                    .map(|x| dname(dedupe.as_ref().unwrap(), x))
-                    .unwrap_or_else(|| safe(&p.name));
+                let out_name = if let Some(d) = dedupe.as_ref() {
+                    let normalized = d
+                        .packages
+                        .iter()
+                        .find(|x| {
+                            x.source.manufacturer == c.manufacturer
+                                && x.source.mpn == c.mpn
+                                && x.source.name == p.name
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("normalized package missing for {} / {}", c.mpn, p.name)
+                        })?;
+                    dname(d, normalized)?
+                } else {
+                    safe(&p.name)
+                };
                 let output = fpdir.join(format!("{out_name}.kicad_mod"));
                 if !deduplicated || !output.exists() {
                     let mut pp = p.clone();
@@ -1105,7 +1074,46 @@ fn kicad_generate(
     println!("generated {manufacturer_count} manufacturer libraries");
     Ok(())
 }
-fn dname(d: &package_normalize::DedupeResult, p: &package_normalize::NormalizedPackage) -> String {
+fn production_footprint_map(
+    components: &[EdaComponent],
+    dedupe: Option<&package_normalize::DedupeResult>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for c in components {
+        for p in &c.packages {
+            if !matches!(
+                eda_model::footprint_eligibility(p),
+                eda_model::FootprintEligibility::Eligible
+            ) {
+                continue;
+            }
+            let key = format!("{}|{}|{}", c.manufacturer, c.mpn, p.name);
+            let name = if let Some(d) = dedupe {
+                let normalized = d
+                    .packages
+                    .iter()
+                    .find(|x| {
+                        x.source.manufacturer == c.manufacturer
+                            && x.source.mpn == c.mpn
+                            && x.source.name == p.name
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("normalized package missing for {} / {}", c.mpn, p.name)
+                    })?;
+                dname(d, normalized)?
+            } else {
+                safe(&p.name)
+            };
+            map.insert(key, name);
+        }
+    }
+    Ok(map)
+}
+
+fn dname(
+    d: &package_normalize::DedupeResult,
+    p: &package_normalize::NormalizedPackage,
+) -> Result<String> {
     d.canonical
         .iter()
         .find(|x| {
@@ -1113,7 +1121,12 @@ fn dname(d: &package_normalize::DedupeResult, p: &package_normalize::NormalizedP
                 && x.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash
         })
         .map(|x| safe(&x.preferred_name))
-        .unwrap_or_else(|| safe(&p.source.name))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "eligible package {} has no canonical KiCad footprint group",
+                p.source.name
+            )
+        })
 }
 fn ti_package_code(s: &str) -> String {
     let u = s.to_ascii_uppercase().replace(['-', '_', ' '], "");
@@ -1765,6 +1778,57 @@ mod tests {
         c.canonicalizer_version = "old-version".into();
         fs::write(&path, serde_json::to_string(&c).unwrap()).unwrap();
         assert!(!cache_matches(&path, &sha('a'), &provenance_hash(&refs)));
+    }
+
+    fn component_with_packages(names: &[&str]) -> EdaComponent {
+        EdaComponent {
+            manufacturer: "TI".into(),
+            mpn: "X".into(),
+            packages: names
+                .iter()
+                .map(|name| eda_model::Package {
+                    name: (*name).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn production_map_supports_safe_non_deduplicated_packages() {
+        let component = component_with_packages(&["SAFE"]);
+        let map = production_footprint_map(&[component], None).unwrap();
+        assert_eq!(map.get("TI|X|SAFE"), Some(&"SAFE".to_string()));
+    }
+
+    #[test]
+    fn production_map_excludes_unsafe_packages() {
+        let mut component = component_with_packages(&["UNSAFE", "SAFE"]);
+        component.packages[0].pads.push(eda_model::Pad {
+            number: "1".into(),
+            drill: Some(eda_model::Point { x_nm: 1, y_nm: 1 }),
+            ..Default::default()
+        });
+        let map = production_footprint_map(&[component], None).unwrap();
+        assert!(!map.contains_key("TI|X|UNSAFE"));
+        assert!(map.contains_key("TI|X|SAFE"));
+    }
+
+    #[test]
+    fn deduplicated_map_requires_a_canonical_group() {
+        let component = component_with_packages(&["SAFE"]);
+        let normalized = package_normalize::normalize_package(&component, &component.packages[0]);
+        let mut broken = normalized.clone();
+        broken.fingerprints.kicad_footprint_hash = Some("missing".into());
+        let dedupe = package_normalize::DedupeResult {
+            packages: vec![broken],
+            canonical: Vec::new(),
+            physical_groups: BTreeMap::new(),
+            manufacturing_groups: BTreeMap::new(),
+            warnings: Vec::new(),
+        };
+        assert!(production_footprint_map(&[component], Some(&dedupe)).is_err());
     }
 
     #[test]

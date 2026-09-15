@@ -168,16 +168,18 @@ fn symbol(
 ) -> String {
     let sn = name(&s.name);
     let mut o = format!("  (symbol \"{sn}\"\n    (pin_names (offset 1.016))\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n");
-    let fp = c
+    let mapped_name = c
         .packages
         .iter()
         .find_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
-        .cloned()
+        .cloned();
+    let footprint_value = mapped_name
+        .map(|name| format!("{nickname}:{name}"))
         .unwrap_or_default();
     let props = [
         ("Reference", "U"),
         ("Value", &c.mpn),
-        ("Footprint", &format!("{nickname}:{fp}")),
+        ("Footprint", &footprint_value),
         ("Datasheet", ""),
         ("Manufacturer", &c.manufacturer),
         ("MPN", &c.mpn),
@@ -443,7 +445,7 @@ mod tests {
             "N",
             &Default::default(),
         );
-        assert!(empty.contains("(property \"Footprint\" \"N:\""));
+        assert!(empty.contains("(property \"Footprint\" \"\""));
         let mut map = std::collections::BTreeMap::new();
         map.insert("TI|X|SAFE".into(), "SafeFootprint".into());
         let output = symbol_lib_many_with_footprints(&[component], "N", &map);
