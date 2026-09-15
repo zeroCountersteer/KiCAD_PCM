@@ -30,6 +30,34 @@ pub struct AssetRecord {
     pub request_url: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FootprintEligibility {
+    Eligible,
+    UnknownDrillPlating { pad: String },
+    UnsupportedShape { pad: String, shape: String },
+}
+
+pub fn footprint_eligibility(package: &Package) -> FootprintEligibility {
+    for pad in &package.pads {
+        if pad.drill.is_some() && pad.plated.is_none() {
+            return FootprintEligibility::UnknownDrillPlating {
+                pad: pad.number.clone(),
+            };
+        }
+        let shape = pad.shape.to_ascii_lowercase();
+        if !matches!(
+            shape.as_str(),
+            "circle" | "oval" | "roundrect" | "rectangle" | "rect"
+        ) {
+            return FootprintEligibility::UnsupportedShape {
+                pad: pad.number.clone(),
+                shape,
+            };
+        }
+    }
+    FootprintEligibility::Eligible
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ManifestRecord {
     pub manufacturer: String,

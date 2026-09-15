@@ -170,13 +170,9 @@ fn symbol(
     let mut o = format!("  (symbol \"{sn}\"\n    (pin_names (offset 1.016))\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n");
     let fp = c
         .packages
-        .first()
-        .map(|p| {
-            footprints
-                .get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name))
-                .cloned()
-                .unwrap_or_else(|| name(&p.name))
-        })
+        .iter()
+        .find_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
+        .cloned()
         .unwrap_or_default();
     let props = [
         ("Reference", "U"),
@@ -404,5 +400,54 @@ mod tests {
         let out = footprint(&EdaComponent::default(), &package);
         assert!(out.contains("UNSUPPORTED: unknown drill plating"));
         assert!(!out.contains("thru_hole"));
+    }
+
+    #[test]
+    fn symbol_has_no_fallback_for_unsafe_package_and_uses_later_safe_package() {
+        let unsafe_package = Package {
+            name: "UNSAFE".into(),
+            pads: vec![eda_model::Pad {
+                number: "1".into(),
+                shape: "circle".into(),
+                size: eda_model::Point {
+                    x_nm: 1_000_000,
+                    y_nm: 1_000_000,
+                },
+                drill: Some(eda_model::Point {
+                    x_nm: 500_000,
+                    y_nm: 500_000,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let safe_package = Package {
+            name: "SAFE".into(),
+            ..Default::default()
+        };
+        let component = EdaComponent {
+            manufacturer: "TI".into(),
+            mpn: "X".into(),
+            symbols: vec![eda_model::Symbol {
+                name: "X".into(),
+                ..Default::default()
+            }],
+            packages: vec![unsafe_package, safe_package],
+            ..Default::default()
+        };
+        let empty = symbol_lib_many_with_footprints(
+            &[EdaComponent {
+                packages: vec![component.packages[0].clone()],
+                ..component.clone()
+            }],
+            "N",
+            &Default::default(),
+        );
+        assert!(empty.contains("(property \"Footprint\" \"N:\""));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("TI|X|SAFE".into(), "SafeFootprint".into());
+        let output = symbol_lib_many_with_footprints(&[component], "N", &map);
+        assert!(output.contains("(property \"Footprint\" \"N:SafeFootprint\""));
+        assert!(!output.contains("N:UNSAFE"));
     }
 }

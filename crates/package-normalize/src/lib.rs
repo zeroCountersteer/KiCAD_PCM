@@ -43,7 +43,7 @@ pub struct Fingerprints {
     pub full_geometry_hash: String,
     /// Identity of the bytes-relevant geometry emitted by the KiCad writer.
     #[serde(default)]
-    pub kicad_footprint_hash: String,
+    pub kicad_footprint_hash: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourcePackage {
@@ -341,10 +341,12 @@ fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> s
 fn kicad_groups(packages: &[NormalizedPackage]) -> BTreeMap<String, Vec<String>> {
     let mut groups = BTreeMap::new();
     for p in packages {
-        groups
-            .entry(p.fingerprints.kicad_footprint_hash.clone())
-            .or_insert_with(Vec::new)
-            .push(format!("{}:{}", p.source.mpn, p.source.name));
+        if let Some(hash) = &p.fingerprints.kicad_footprint_hash {
+            groups
+                .entry(hash.clone())
+                .or_insert_with(Vec::new)
+                .push(format!("{}:{}", p.source.mpn, p.source.name));
+        }
     }
     groups
 }
@@ -376,7 +378,12 @@ pub fn normalize_package(c: &EdaComponent, p: &Package) -> NormalizedPackage {
         electrical_geometry_hash: hash(&fingerprint(2)),
         manufacturing_hash: hash(&fingerprint(3)),
         full_geometry_hash: hash(&fingerprint(4)),
-        kicad_footprint_hash: hash(&kicad_projection(&pads, &graphics)),
+        kicad_footprint_hash: match eda_model::footprint_eligibility(p) {
+            eda_model::FootprintEligibility::Eligible => {
+                Some(hash(&kicad_projection(&pads, &graphics)))
+            }
+            _ => None,
+        },
     };
     let mut warnings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -454,7 +461,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
     for (h, names) in &kicad_groups(&packages) {
         let ix = packages
             .iter()
-            .position(|p| p.fingerprints.kicad_footprint_hash == *h)
+            .position(|p| p.fingerprints.kicad_footprint_hash.as_deref() == Some(h))
             .unwrap();
         let mut aliases = names.clone();
         aliases.sort();
@@ -464,7 +471,7 @@ pub fn dedupe(cs: &[EdaComponent]) -> DedupeResult {
             aliases,
             sources: packages
                 .iter()
-                .filter(|p| p.fingerprints.kicad_footprint_hash == *h)
+                .filter(|p| p.fingerprints.kicad_footprint_hash.as_deref() == Some(h))
                 .map(|p| p.source.clone())
                 .collect(),
             representative: packages[ix].clone(),

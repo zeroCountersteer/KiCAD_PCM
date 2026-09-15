@@ -996,21 +996,39 @@ fn kicad_generate(
     } else {
         None
     };
+    let eligible_keys = by_m
+        .values()
+        .flatten()
+        .flat_map(|c| {
+            c.packages
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        eda_model::footprint_eligibility(p),
+                        eda_model::FootprintEligibility::Eligible
+                    )
+                })
+                .map(|p| format!("{}|{}|{}", c.manufacturer, c.mpn, p.name))
+        })
+        .collect::<BTreeSet<_>>();
     let footprint_map = dedupe
         .as_ref()
         .map(|d| {
             let mut m = std::collections::BTreeMap::new();
             for p in &d.packages {
+                let key = format!(
+                    "{}|{}|{}",
+                    p.source.manufacturer, p.source.mpn, p.source.name
+                );
+                if !eligible_keys.contains(&key) {
+                    continue;
+                }
                 if let Some(g) = d.canonical.iter().find(|g| {
-                    g.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash
+                    g.fingerprints.kicad_footprint_hash.is_some()
+                        && g.fingerprints.kicad_footprint_hash
+                            == p.fingerprints.kicad_footprint_hash
                 }) {
-                    m.insert(
-                        format!(
-                            "{}|{}|{}",
-                            p.source.manufacturer, p.source.mpn, p.source.name
-                        ),
-                        safe(&g.preferred_name),
-                    );
+                    m.insert(key, safe(&g.preferred_name));
                 }
             }
             m
@@ -1039,28 +1057,16 @@ fn kicad_generate(
         fs::create_dir_all(&fpdir)?;
         for c in &items {
             for p in &c.packages {
-                if p.pads
-                    .iter()
-                    .any(|pad| pad.drill.is_some() && pad.plated.is_none())
-                {
-                    report.push_str(&format!(
-                        "* {} / {}: skipped production footprint; drill plating is unspecified\n",
-                        c.mpn, p.name
-                    ));
-                    continue;
-                }
-                if let Some(shape) = p.pads.iter().find_map(|pad| {
-                    (!matches!(
-                        pad.shape.to_ascii_lowercase().as_str(),
-                        "circle" | "oval" | "roundrect" | "rectangle" | "rect"
-                    ))
-                    .then_some(pad.shape.as_str())
-                }) {
-                    report.push_str(&format!(
-                        "* {} / {}: skipped production footprint; unsupported pad shape `{shape}`\n",
-                        c.mpn, p.name
-                    ));
-                    continue;
+                match eda_model::footprint_eligibility(p) {
+                    eda_model::FootprintEligibility::Eligible => {}
+                    eda_model::FootprintEligibility::UnknownDrillPlating { pad } => {
+                        report.push_str(&format!("* {} / {}: skipped production footprint; drill plating is unspecified for pad {}\n", c.mpn, p.name, pad));
+                        continue;
+                    }
+                    eda_model::FootprintEligibility::UnsupportedShape { pad, shape } => {
+                        report.push_str(&format!("* {} / {}: skipped production footprint; unsupported pad shape `{shape}` on pad {pad}\n", c.mpn, p.name));
+                        continue;
+                    }
                 }
                 let out_name = dedupe
                     .as_ref()
@@ -1102,7 +1108,10 @@ fn kicad_generate(
 fn dname(d: &package_normalize::DedupeResult, p: &package_normalize::NormalizedPackage) -> String {
     d.canonical
         .iter()
-        .find(|x| x.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash)
+        .find(|x| {
+            x.fingerprints.kicad_footprint_hash.is_some()
+                && x.fingerprints.kicad_footprint_hash == p.fingerprints.kicad_footprint_hash
+        })
         .map(|x| safe(&x.preferred_name))
         .unwrap_or_else(|| safe(&p.source.name))
 }
@@ -1769,8 +1778,7 @@ mod tests {
         let pad = &component.packages[0].pads[0];
         assert!(pad.drill.as_ref().is_some_and(|d| d.x_nm > 0));
         let output = kicad::footprint(&component, &component.packages[0]);
-        assert!(output.contains("thru_hole"));
-        assert!(output.contains("(drill "));
-        assert!(!output.contains("(attr smd)"));
+        assert!(output.contains("UNSUPPORTED: unknown drill plating"));
+        assert!(!output.contains("thru_hole"));
     }
 }
