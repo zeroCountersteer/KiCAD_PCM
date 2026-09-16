@@ -93,6 +93,12 @@ enum Command {
     KicadCheck {
         path: PathBuf,
     },
+    KicadReferenceCheck {
+        #[arg(long)] mpn: Option<String>,
+        #[arg(long)] mpn_file: Option<PathBuf>,
+        #[arg(long)] reference_root: PathBuf,
+        #[arg(long)] json: bool,
+    },
 }
 fn main() -> Result<()> {
     let c = Cli::parse();
@@ -153,7 +159,52 @@ fn main() -> Result<()> {
         Command::ModelInfo { query } => model_info(&c.data, &query),
         Command::TiCorpusReport => ti_corpus_report(&c.data),
         Command::KicadCheck { path } => kicad_check(&path),
+        Command::KicadReferenceCheck { mpn, mpn_file, reference_root, json } =>
+            kicad_reference_check(&c.data, mpn.as_deref(), mpn_file.as_deref(), &reference_root, json),
     }
+}
+
+fn kicad_reference_check(data: &Path, single: Option<&str>, file: Option<&Path>, reference_root: &Path, json: bool) -> Result<()> {
+    let mut wanted = BTreeSet::new();
+    if let Some(mpn) = single { wanted.insert(mpn.to_owned()); }
+    if let Some(file) = file { wanted.extend(parse_mpn_file(file)?); }
+    if wanted.is_empty() { anyhow::bail!("provide --mpn or --mpn-file"); }
+    let mut rows = Vec::new();
+    for mpn in wanted {
+        let symbol_name = if mpn == "BQ24090DGQR" { "BQ24090DGQ" } else { &mpn };
+        let symbol = find_reference_file(&reference_root.join("symbols"), symbol_name, "kicad_sym")?;
+        let component_path = data.join("derived/components/Texas_Instruments").join(format!("{}.json", kicad::name(&mpn)));
+        let package_names = fs::read_to_string(&component_path).ok()
+            .and_then(|s| serde_json::from_str::<EdaComponent>(&s).ok())
+            .map(|c| c.packages.into_iter().map(|p| p.name).collect::<Vec<_>>()).unwrap_or_default();
+        let footprint_query = if mpn == "BQ24090DGQR" { "HVSSOP-10-1EP_3x3mm_P0.5mm" } else { &package_names.join(" ") };
+        let footprint = find_reference_file(&reference_root.join("footprints"), footprint_query, "kicad_mod")?;
+        let class = if symbol.is_some() && footprint.is_some() { "exact_symbol_and_footprint" }
+            else if symbol.is_some() { "exact_symbol_only" }
+            else if footprint.is_some() { "exact_package_footprint" }
+            else { "no_reference" };
+        rows.push(serde_json::json!({"mpn": mpn, "symbol_query": symbol_name, "symbol": symbol, "package_queries": package_names, "footprint": footprint, "classification": class}));
+    }
+    let dir = data.join("generated/reference");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("kicad-reference-map.json"), format!("{}\n", serde_json::to_string_pretty(&rows)?))?;
+    let mut md = String::from("# KiCad 10.0.4 reference map\n\n| MPN | Class | Symbol | Footprint |\n|---|---|---|---|\n");
+    for row in &rows { md.push_str(&format!("| {} | {} | {} | {} |\n", row["mpn"].as_str().unwrap_or(""), row["classification"].as_str().unwrap_or(""), row["symbol"].as_str().unwrap_or("none"), row["footprint"].as_str().unwrap_or("none"))); }
+    fs::write(dir.join("kicad-reference-map.md"), &md)?;
+    if json { println!("{}", serde_json::to_string_pretty(&rows)?); } else { println!("{}", md); }
+    Ok(())
+}
+fn find_reference_file(root: &Path, query: &str, extension: &str) -> Result<Option<String>> {
+    if !root.is_dir() { return Ok(None); }
+    let needles = query.split_whitespace().filter(|x| !x.is_empty()).collect::<Vec<_>>();
+    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == extension)) {
+        let filename = entry.file_name().to_string_lossy();
+        let text = fs::read_to_string(entry.path()).unwrap_or_default();
+        if needles.iter().any(|n| filename.contains(n) || text.contains(&format!("\"{n}\""))) {
+            return Ok(Some(entry.path().strip_prefix(root)?.display().to_string()));
+        }
+    }
+    Ok(None)
 }
 fn convert(
     input: PathBuf,

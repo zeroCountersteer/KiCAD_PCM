@@ -412,8 +412,9 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         } else {
             "smd"
         };
+        let paste_split = kind == "smd" && x.paste_size.as_ref().is_some_and(|size| size != &x.size);
         let default_layers = if kind == "smd" {
-            "\"F.Cu\" \"F.Paste\" \"F.Mask\""
+            if paste_split { "\"F.Cu\" \"F.Mask\"" } else { "\"F.Cu\" \"F.Paste\" \"F.Mask\"" }
         } else {
             "\"*.Cu\" \"*.Mask\""
         };
@@ -439,6 +440,11 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
             .as_ref()
             .map(|d| format!(" (drill {})", mm(d.x_nm)))
             .unwrap_or_default();
+        let mask_margin = x.solder_mask_size.as_ref().and_then(|size| {
+            let dx = (size.x_nm - x.size.x_nm) / 2;
+            let dy = (size.y_nm - x.size.y_nm) / 2;
+            (dx == dy && dx != 0).then(|| format!(" (solder_mask_margin {})", mm(dx)))
+        }).unwrap_or_default();
         let _ = writeln!(
             o,
             "  (pad \"{}\" {} {} (at {} {} {}) (size {} {}) (layers {}){})",
@@ -453,6 +459,19 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
             layers,
             drill
         );
+        if !mask_margin.is_empty() {
+            let needle = format!("(pad \"{}\"", esc(&x.number));
+            if let Some(pos) = o.rfind(&needle) {
+                let insert = pos + o[pos..].find('\n').unwrap_or(0);
+                o.insert_str(insert, &mask_margin);
+            }
+        }
+        if paste_split {
+            let size = x.paste_size.as_ref().unwrap();
+            let _ = writeln!(o, "  (pad \"\" smd {} (at {} {} {}) (size {} {}) (layers \"F.Paste\"){})",
+                shape, mm(x.position.x_nm), mm(x.position.y_nm), angle(x.rotation_mdeg),
+                mm(size.x_nm), mm(size.y_nm), if shape == "roundrect" { " (roundrect_rratio 0.25)" } else { "" });
+        }
     }
     if let Some(path) = model {
         o.push_str(&format!(

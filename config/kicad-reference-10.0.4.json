@@ -1,0 +1,6 @@
+{
+  "release": "10.0.4",
+  "symbols": {"url": "https://gitlab.com/kicad/libraries/kicad-symbols.git", "tag": "10.0.4", "commit": "dcd4e9e491eee9b8835b843d8ac92e8c2a7e10f8"},
+  "footprints": {"url": "https://gitlab.com/kicad/libraries/kicad-footprints.git", "tag": "10.0.4", "commit": "cb8299c2ba2baed8d76a9207b76e4884bcfc24e6"},
+  "packages3d": {"url": "https://gitlab.com/kicad/libraries/kicad-packages3D.git", "tag": "10.0.4", "commit": "0bc64e922178140eb6890377646efd45e15011bd"}
+}

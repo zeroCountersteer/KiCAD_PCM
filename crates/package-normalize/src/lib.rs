@@ -18,6 +18,8 @@ pub struct NormalizedPad {
     pub layers: Vec<String>,
     pub mask_nm: Option<i64>,
     pub paste: Option<bool>,
+    #[serde(default)]
+    pub paste_size: Option<Point>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedGraphic {
@@ -242,6 +244,7 @@ fn pad(p: &Pad) -> NormalizedPad {
         layers: p.layers.clone(),
         mask_nm: p.solder_mask_expansion_nm,
         paste: p.paste,
+        paste_size: p.paste_size.clone(),
     }
 }
 fn hash<T: Serialize>(v: &T) -> String {
@@ -346,6 +349,7 @@ fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> s
                 "x": p.x_nm, "y": p.y_nm, "rotation": p.rotation_mdeg,
                 "width": p.width_nm, "height": p.height_nm, "layers": layers,
                 "drill": p.drill.as_ref().map(|d| d.x_nm),
+                "mask": p.mask_nm, "paste_size": p.paste_size.as_ref().map(|x| [x.x_nm, x.y_nm]),
             })
         })
         .collect::<Vec<_>>();
@@ -640,6 +644,7 @@ mod tests {
             layers: Vec::new(),
             mask_nm: None,
             paste: None,
+            paste_size: None,
         };
         let (pads, _, _) = transformed(vec![p], Vec::new(), 90000, false);
         assert_eq!((pads[0].width_nm, pads[0].height_nm), (1000, 2000));

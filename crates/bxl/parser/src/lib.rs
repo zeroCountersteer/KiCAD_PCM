@@ -6,9 +6,12 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
-pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v7";
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v10";
 #[derive(Clone, Debug)]
 struct ParsedPadShape { layer: Option<String>, shape: String, width_nm: i64, height_nm: i64 }
+fn stack_shape<'a>(shapes: &'a [ParsedPadShape], wanted: &[&str]) -> Option<&'a ParsedPadShape> {
+    shapes.iter().find(|s| s.layer.as_deref().is_some_and(|l| wanted.contains(&l)))
+}
 fn canonical_pad_shape(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "oblong" => "oval".into(),
@@ -87,9 +90,8 @@ pub fn canonicalize(
         return c;
     };
     let ps = Regex::new(r#"PadStack\s+"([^"]+)""#).unwrap();
-    let sh =
-        Regex::new(r#"PadShape\s+"([^"]+)".*?\(Width\s+([-0-9.]+)\).*?\(Height\s+([-0-9.]+)\).*?(?:\(Layer\s+([^\)]+)\))?"#)
-            .unwrap();
+    let sh = Regex::new(r#"PadShape\s+"([^"]+)".*?\(Width\s+([-0-9.]+)\).*?\(Height\s+([-0-9.]+)\).*?\(Layer\s+([^\)]+)\)"#).unwrap();
+    let sh_unlayered = Regex::new(r#"PadShape\s+"([^"]+)".*?\(Width\s+([-0-9.]+)\).*?\(Height\s+([-0-9.]+)\)\s*$"#).unwrap();
     let mut stacks: BTreeMap<String, Vec<ParsedPadShape>> = BTreeMap::new();
     let drill_re = Regex::new(r#"(?:Drill|DrillSize)\s+\(?\s*([-0-9.]+)"#).unwrap();
     let mut stack_drills: BTreeMap<String, i64> = BTreeMap::new();
@@ -101,7 +103,7 @@ pub fn canonicalize(
         if let Some(m) = ps.captures(line) {
             current = Some(m[1].to_string())
         }
-        if let Some(m) = sh.captures(line) {
+        if let Some(m) = sh.captures(line).or_else(|| sh_unlayered.captures(line)) {
             if let Some(k) = current.clone() {
                 stacks.entry(k).or_default().push(ParsedPadShape {
                     layer: m.get(4).map(|x| normalize_layer(x.as_str())),
@@ -192,6 +194,13 @@ pub fn canonicalize(
                 });
                 let (shape, w, h) = selected.map(|s| (s.shape.clone(), s.width_nm, s.height_nm))
                     .unwrap_or(("unknown".into(), 0, 0));
+                let mask = stacks.get(&m[3]).and_then(|shapes| stack_shape(shapes, &["TOP_SOLDER_MASK", "BOTTOM_SOLDER_MASK"]));
+                let paste = stacks.get(&m[3]).and_then(|shapes| stack_shape(shapes, &["TOP_PASTE", "TOP_SOLDER_PASTE", "BOTTOM_PASTE", "BOTTOM_SOLDER_PASTE"]));
+                let mask_expansion = mask.and_then(|s| {
+                    let dx = (s.width_nm - w) / 2;
+                    let dy = (s.height_nm - h) / 2;
+                    (dx == dy).then_some(dx)
+                });
                 p.pads.push(Pad {
                     number: m[1].trim().into(),
                     name: Some(m[2].into()),
@@ -209,6 +218,9 @@ pub fn canonicalize(
                     // source attribute is decoded.
                     plated: None,
                     rotation_mdeg: pad_rotate_re.captures(line).and_then(|x| x[1].parse::<f64>().ok()).unwrap_or(0.0) as i32 * 1000,
+                    solder_mask_size: mask.map(|s| Point { x_nm: s.width_nm, y_nm: s.height_nm }),
+                    paste_size: paste.map(|s| Point { x_nm: s.width_nm, y_nm: s.height_nm }),
+                    solder_mask_expansion_nm: mask_expansion,
                     ..Default::default()
                 })
             }
@@ -426,5 +438,7 @@ EndPattern
 "#.into()) };
         let c = canonicalize(&doc, "TI", "X", None);
         assert_eq!(c.packages[0].pads[0].size, Point { x_nm: 609600, y_nm: 1219200 });
+        assert_eq!(c.packages[0].pads[0].solder_mask_size, Some(Point { x_nm: 711200, y_nm: 1320800 }));
+        assert_eq!(c.packages[0].pads[0].paste_size, Some(Point { x_nm: 508000, y_nm: 1117600 }));
     }
 }

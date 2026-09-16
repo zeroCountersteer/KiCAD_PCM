@@ -236,6 +236,10 @@ pub struct Pad {
     pub layers: Vec<String>,
     pub solder_mask_expansion_nm: Option<i64>,
     pub paste: Option<bool>,
+    #[serde(default)]
+    pub solder_mask_size: Option<Point>,
+    #[serde(default)]
+    pub paste_size: Option<Point>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ModelRef {
