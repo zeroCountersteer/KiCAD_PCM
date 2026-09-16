@@ -194,6 +194,40 @@ fn physical_graphic(g: &Graphic) -> bool {
     matches!(layer.to_ascii_uppercase().as_str(), "TOP_ASSEMBLY" | "BOTTOM_ASSEMBLY") &&
         !matches!(g, Graphic::Text { .. })
 }
+fn pad_bounds(pad: &eda_model::Pad) -> (i64, i64, i64, i64) {
+    let quarter_turn = pad.rotation_mdeg.rem_euclid(180000) == 90000;
+    let (w, h) = if quarter_turn { (pad.size.y_nm, pad.size.x_nm) } else { (pad.size.x_nm, pad.size.y_nm) };
+    (pad.position.x_nm - w / 2, pad.position.y_nm - h / 2,
+        pad.position.x_nm + w / 2, pad.position.y_nm + h / 2)
+}
+fn silk_edge(start: (i64, i64), end: (i64, i64), pads: &[eda_model::Pad]) -> Vec<(i64, i64, i64, i64)> {
+    let mut spans = vec![(start.0, end.0)];
+    let horizontal = start.1 == end.1;
+    for pad in pads {
+        let (x0, y0, x1, y1) = pad_bounds(pad);
+        let (x0, x1, y0, y1) = (x0 - 200000, x1 + 200000, y0 - 200000, y1 + 200000);
+        if horizontal && start.1 >= y0 && start.1 <= y1 {
+            spans = spans.into_iter().flat_map(|(a, b)| {
+                let lo = a.min(b); let hi = a.max(b);
+                if x1 <= lo || x0 >= hi { return vec![(a, b)]; }
+                [
+                    (lo, x0.min(hi)),
+                    (x1.max(lo), hi),
+                ].into_iter().filter(|(x, y)| y - x > 100000).map(|(x, y)| if a <= b {(x,y)} else {(y,x)}).collect()
+            }).collect();
+        } else if !horizontal && start.0 >= x0 && start.0 <= x1 {
+            spans = spans.into_iter().flat_map(|(a, b)| {
+                let lo = a.min(b); let hi = a.max(b);
+                if y1 <= lo || y0 >= hi { return vec![(a, b)]; }
+                [
+                    (lo, y0.min(hi)),
+                    (y1.max(lo), hi),
+                ].into_iter().filter(|(x, y)| y - x > 100000).map(|(x, y)| if a <= b {(x,y)} else {(y,x)}).collect()
+            }).collect();
+        }
+    }
+    spans.into_iter().filter(|(a, b)| a != b).map(|(a,b)| if horizontal {(a,start.1,b,end.1)} else {(start.0,a,end.0,b)}).collect()
+}
 pub fn symbol_bounds(s: &Symbol) -> (i64, i64, i64, i64) {
     let mut b = graphic_bounds(&s.units.iter().flat_map(|u| u.graphics.clone()).collect::<Vec<_>>());
     let mut add = |x: i64, y: i64| b = Some(match b { Some((a,c,d,e)) => (a.min(x), c.min(y), d.max(x), e.max(y)), None => (x,y,x,y) });
@@ -337,9 +371,16 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
     let physical_graphics = p.graphics.iter().filter(|g| physical_graphic(g)).cloned().collect::<Vec<_>>();
     if let Some((a,b,c,d)) = graphic_bounds(&physical_graphics) { bound(a,b); bound(c,d); }
     if min_x == i64::MAX { min_x = -500_000; min_y = -500_000; max_x = 500_000; max_y = 500_000; }
+    let (body_x0, body_y0, body_x1, body_y1) = graphic_bounds(&physical_graphics).unwrap_or((min_x, min_y, max_x, max_y));
     o.push_str(&format!("  (fp_text reference \"REF**\" (at {} {} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{}\" (at {} {} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))\n",mm((min_x+max_x)/2),mm(max_y+2_000_000),esc(&p.name),mm((min_x+max_x)/2),mm(min_y-2_000_000)));
-    for g in &p.graphics {
-        if let Some(out) = footprint_graphic(g) { o.push_str(&out); }
+    o.push_str(&format!("  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.1) (type default)) (fill none) (layer \"F.Fab\"))\n", mm(body_x0), mm(body_y0), mm(body_x1), mm(body_y1)));
+    let silk_clearance = 200000i64;
+    let sx0 = body_x0 - silk_clearance; let sy0 = body_y0 - silk_clearance;
+    let sx1 = body_x1 + silk_clearance; let sy1 = body_y1 + silk_clearance;
+    for (a,b,c,d) in [(sx0,sy0,sx1,sy0),(sx1,sy0,sx1,sy1),(sx1,sy1,sx0,sy1),(sx0,sy1,sx0,sy0)] {
+        for (x0,y0,x1,y1) in silk_edge((a,b),(c,d),&p.pads) {
+            o.push_str(&format!("  (fp_line (start {} {}) (end {} {}) (stroke (width 0.12) (type default)) (layer \"F.SilkS\"))\n",mm(x0),mm(y0),mm(x1),mm(y1)));
+        }
     }
     let clearance = 250_000i64;
     let snap_min = |n: i64| (n.div_euclid(10_000)) * 10_000;
@@ -422,6 +463,7 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
     o.push_str(")\n");
     o
 }
+#[allow(dead_code)]
 fn footprint_graphic(g: &Graphic) -> Option<String> {
     let src = match g { Graphic::Line{layer,..}|Graphic::Arc{layer,..}|Graphic::Circle{layer,..}|Graphic::Rectangle{layer,..}|Graphic::Polygon{layer,..}|Graphic::Text{layer,..} => layer };
     let l = layer(src)?;
@@ -636,7 +678,7 @@ mod tests {
             ..Default::default()
         };
         let out = footprint(&EdaComponent::default(), &package);
-        assert_eq!(out.matches("(fp_rect ").count(), 1);
+        assert!(out.matches("(fp_rect ").count() >= 2);
         assert!(out.contains("(width 0.05)"));
         assert!(out.contains("(layer \"F.CrtYd\")"));
     }
@@ -647,13 +689,16 @@ mod tests {
             Graphic::Line { start:Point{x_nm:-1_000_000,y_nm:-1_000_000}, end:Point{x_nm:1_000_000,y_nm:-1_000_000}, width_nm:100_000, layer:"TOP_SILKSCREEN".into() },
             Graphic::Arc { center:Point{x_nm:0,y_nm:0}, start:Point{x_nm:1_000_000,y_nm:0}, end:Point{x_nm:0,y_nm:1_000_000}, width_nm:100_000, layer:"TOP_SILKSCREEN".into() },
             Graphic::Circle { center:Point{x_nm:0,y_nm:0}, radius_nm:1_000_000, width_nm:100_000, layer:"TOP_SILKSCREEN".into() },
-            Graphic::Rectangle { start:Point{x_nm:-1_000_000,y_nm:-1_000_000}, end:Point{x_nm:1_000_000,y_nm:1_000_000}, width_nm:100_000, fill:false, layer:"TOP_SILKSCREEN".into() },
+            Graphic::Rectangle { start:Point{x_nm:-1_000_000,y_nm:-1_000_000}, end:Point{x_nm:1_000_000,y_nm:1_000_000}, width_nm:100_000, fill:false, layer:"TOP_ASSEMBLY".into() },
             Graphic::Polygon { points:vec![Point{x_nm:0,y_nm:0},Point{x_nm:1_000_000,y_nm:0}], width_nm:100_000, fill:false, layer:"TOP_SILKSCREEN".into() },
             Graphic::Text { text:"mark".into(), position:Point{x_nm:0,y_nm:0}, rotation_mdeg:0, height_nm:1_000_000, width_nm:1_000_000, layer:"TOP_SILKSCREEN".into() },
         ], ..Default::default() };
         let out = footprint(&EdaComponent::default(), &p);
-        for token in ["(fp_line ","(fp_arc ","(fp_circle ","(fp_rect ","(fp_poly ","(fp_text user "] { assert!(out.contains(token), "missing {token}"); }
-        assert!(out.contains("(fp_text reference \"REF**\" (at 0 2.5"));
-        assert!(out.contains("(fp_text value \"G\" (at 0 -2.5"));
+        assert!(out.contains("(fp_rect (start -1 -1) (end 1 1)"));
+        assert!(out.contains("(stroke (width 0.12)"));
+        assert!(!out.contains("(fp_arc "));
+        assert!(!out.contains("(fp_text user \"mark\""));
+        assert!(out.contains("(fp_text reference \"REF**\" (at 0 3"));
+        assert!(out.contains("(fp_text value \"G\" (at 0 -3"));
     }
 }

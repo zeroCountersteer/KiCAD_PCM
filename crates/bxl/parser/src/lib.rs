@@ -6,9 +6,17 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
-pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v5";
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v7";
 #[derive(Clone, Debug)]
 struct ParsedPadShape { layer: Option<String>, shape: String, width_nm: i64, height_nm: i64 }
+fn canonical_pad_shape(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "oblong" => "oval".into(),
+        "round" => "circle".into(),
+        "square" => "rect".into(),
+        other => other.into(),
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section { None, Pattern, Symbol }
 fn normalize_layer(raw: &str) -> String {
@@ -97,7 +105,7 @@ pub fn canonicalize(
             if let Some(k) = current.clone() {
                 stacks.entry(k).or_default().push(ParsedPadShape {
                     layer: m.get(4).map(|x| normalize_layer(x.as_str())),
-                    shape: m[1].into(), width_nm: mil_nm(&m[2]), height_nm: mil_nm(&m[3]),
+                    shape: canonical_pad_shape(&m[1]), width_nm: mil_nm(&m[2]), height_nm: mil_nm(&m[3]),
                 });
             }
         }

@@ -962,7 +962,7 @@ fn kicad_generate(
                 fs::read_to_string(p)
                     .ok()
                     .and_then(|text| serde_json::from_str::<EdaComponent>(&text).ok())
-                    .is_some_and(|component| wanted.contains(&component.mpn))
+                    .is_some_and(|component| wanted.contains(&component.mpn) || component.metadata.get("associated_mpns").is_some_and(|aliases| aliases.split(';').any(|mpn| wanted.contains(mpn))))
             });
         }
         let missing = expected
@@ -992,7 +992,18 @@ fn kicad_generate(
         if !all && mpn.as_deref().is_some_and(|x| x != c.mpn) {
             continue;
         }
-        if wanted.as_ref().is_some_and(|set| !set.contains(&c.mpn)) { continue; }
+        if let Some(set) = &wanted {
+            let aliases = c.metadata.get("associated_mpns").map(|v| v.split(';').filter(|mpn| set.contains(*mpn)).collect::<Vec<_>>()).unwrap_or_default();
+            if !set.contains(&c.mpn) && aliases.is_empty() { continue; }
+            if !set.contains(&c.mpn) {
+                for alias in aliases {
+                    let mut view = c.clone();
+                    view.mpn = alias.to_owned();
+                    cs.push(view);
+                }
+                continue;
+            }
+        }
         if manufacturer
             .as_deref()
             .is_some_and(|x| x != "ti" && x != c.manufacturer)
