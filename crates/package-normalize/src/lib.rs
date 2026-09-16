@@ -353,7 +353,10 @@ fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> s
         .iter()
         .map(|g| serde_json::json!({"kind": g.kind, "data": g.data, "width": g.width_nm, "height": g.height_nm, "fill": g.fill, "text": g.text, "layer": kicad_layer(&g.layer)}))
         .collect::<Vec<_>>();
-    let b = bounds(pads, graphics);
+    let physical_graphics = graphics.iter().filter(|g| {
+        matches!(g.layer.to_ascii_uppercase().as_str(), "TOP_ASSEMBLY" | "BOTTOM_ASSEMBLY") && g.kind != "text"
+    }).cloned().collect::<Vec<_>>();
+    let b = bounds(pads, &physical_graphics);
     let clearance = 250_000i64;
     let floor_grid = |n: i64| n.div_euclid(10_000) * 10_000;
     let ceil_grid = |n: i64| (n + 9_999).div_euclid(10_000) * 10_000;

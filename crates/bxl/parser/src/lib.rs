@@ -6,7 +6,9 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
-pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v4";
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v5";
+#[derive(Clone, Debug)]
+struct ParsedPadShape { layer: Option<String>, shape: String, width_nm: i64, height_nm: i64 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section { None, Pattern, Symbol }
 fn normalize_layer(raw: &str) -> String {
@@ -78,9 +80,9 @@ pub fn canonicalize(
     };
     let ps = Regex::new(r#"PadStack\s+"([^"]+)""#).unwrap();
     let sh =
-        Regex::new(r#"PadShape\s+"([^"]+)"\s+\(Width\s+([-0-9.]+)\)\s+\(Height\s+([-0-9.]+)\)"#)
+        Regex::new(r#"PadShape\s+"([^"]+)".*?\(Width\s+([-0-9.]+)\).*?\(Height\s+([-0-9.]+)\).*?(?:\(Layer\s+([^\)]+)\))?"#)
             .unwrap();
-    let mut stacks: BTreeMap<String, (String, i64, i64)> = BTreeMap::new();
+    let mut stacks: BTreeMap<String, Vec<ParsedPadShape>> = BTreeMap::new();
     let drill_re = Regex::new(r#"(?:Drill|DrillSize)\s+\(?\s*([-0-9.]+)"#).unwrap();
     let mut stack_drills: BTreeMap<String, i64> = BTreeMap::new();
     let pin_map_re = Regex::new(
@@ -93,7 +95,10 @@ pub fn canonicalize(
         }
         if let Some(m) = sh.captures(line) {
             if let Some(k) = current.clone() {
-                stacks.insert(k, (m[1].into(), mil_nm(&m[2]), mil_nm(&m[3])));
+                stacks.entry(k).or_default().push(ParsedPadShape {
+                    layer: m.get(4).map(|x| normalize_layer(x.as_str())),
+                    shape: m[1].into(), width_nm: mil_nm(&m[2]), height_nm: mil_nm(&m[3]),
+                });
             }
         }
         if let Some(m) = drill_re.captures(line) {
@@ -172,9 +177,12 @@ pub fn canonicalize(
         }
         if let Some(m) = pad.captures(line) {
             if let Some(p) = package.as_mut() {
-                let (shape, w, h) = stacks
-                    .get(&m[3])
-                    .cloned()
+                let selected = stacks.get(&m[3]).and_then(|shapes| {
+                    shapes.iter().find(|s| matches!(s.layer.as_deref(), Some("TOP_COPPER") | Some("TOP")))
+                        .or_else(|| shapes.iter().find(|s| s.layer.is_none()))
+                        .or_else(|| shapes.iter().find(|s| matches!(s.layer.as_deref(), Some("BOTTOM_COPPER") | Some("BOTTOM"))))
+                });
+                let (shape, w, h) = selected.map(|s| (s.shape.clone(), s.width_nm, s.height_nm))
                     .unwrap_or(("unknown".into(), 0, 0));
                 p.pads.push(Pad {
                     number: m[1].trim().into(),
@@ -394,5 +402,21 @@ EndPattern
         let c = canonicalize(&doc, "TI", "X", None);
         let p = &c.packages[0].pads[0];
         assert_eq!((p.size.x_nm, p.size.y_nm, p.rotation_mdeg), (254000, 508000, 90000));
+    }
+
+    #[test]
+    fn selects_copper_shape_from_layered_pad_stack() {
+        let doc = BxlDocument { version: None, records: Vec::new(), raw_text: Some(r#"
+PadStack "S"
+ PadShape "Rectangle" (Width 24) (Height 48) (PadType 0) (Layer TOP)
+ PadShape "Rectangle" (Width 28) (Height 52) (PadType 0) (Layer TOP_SOLDER_MASK)
+ PadShape "Rectangle" (Width 20) (Height 44) (PadType 0) (Layer TOP_SOLDER_PASTE)
+EndPadStack
+Pattern "P"
+ Pad (Number 1) (PinName "1") (PadStyle "S") (Origin 0, 0)
+EndPattern
+"#.into()) };
+        let c = canonicalize(&doc, "TI", "X", None);
+        assert_eq!(c.packages[0].pads[0].size, Point { x_nm: 609600, y_nm: 1219200 });
     }
 }

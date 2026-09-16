@@ -1508,6 +1508,19 @@ fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str)
             if nick != expected_nickname { anyhow::bail!("wrong footprint prefix {nick}, expected {expected_nickname}"); }
             if !footprint_names.contains(name) { anyhow::bail!("dangling footprint reference {value}"); }
         }
+        for line in text.lines().filter(|x| x.contains("(property \"ki_fp_filters\"")) {
+            let value = line.split('"').nth(3).unwrap_or("");
+            for filter in value.split_whitespace() {
+                let Some((nick, name)) = filter.split_once(':') else { anyhow::bail!("invalid footprint filter {filter}"); };
+                if nick != expected_nickname { anyhow::bail!("wrong footprint filter prefix {nick}, expected {expected_nickname}"); }
+                let exact = name.trim_end_matches('*');
+                if exact.is_empty() || !footprint_names.contains(exact) { anyhow::bail!("dangling footprint filter {filter}"); }
+            }
+        }
+    }
+    for e in walkdir::WalkDir::new(&fpdir).into_iter().filter_map(Result::ok) {
+        if !e.path().extension().is_some_and(|x| x == "kicad_mod") { continue; }
+        let text = fs::read_to_string(e.path())?;
         for line in text.lines().filter(|x| x.contains("(model \"")) {
             let value = line.split('"').nth(1).unwrap_or("");
             if value.starts_with('/') || value.contains("data/generated") || value.contains("target/") {

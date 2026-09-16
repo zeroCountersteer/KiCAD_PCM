@@ -131,36 +131,12 @@ pub fn symbol_lib_many_with_policy(
         format!("(kicad_symbol_lib (version {KICAD_VERSION}) (generator \"kicad_symbol_editor\") (generator_version \"10.0\")\n");
     let mut used = BTreeSet::new();
     for c in cs {
-        let choices = c
-            .packages
-            .iter()
-            .filter_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let variants = if choices.len() > 1 {
-            choices.into_iter().map(Some).collect::<Vec<_>>()
-        } else {
-            vec![None]
-        };
-        for variant in variants {
-            let selected = variant.as_deref();
-            let variant_map = selected.map(|wanted| {
-                c.packages.iter().filter_map(|p| {
-                    let key = format!("{}|{}|{}", c.manufacturer, c.mpn, p.name);
-                    (footprints.get(&key).is_some_and(|x| x == wanted))
-                        .then(|| (key, wanted.to_owned()))
-                }).collect::<std::collections::BTreeMap<_, _>>()
-            });
-            for s in &c.symbols {
-                let mut copy = s.clone();
-                if let Some(wanted) = selected {
-                    copy.name = format!("{}__{}", copy.name, name(wanted));
-                }
-                if !used.insert(name(&copy.name)) {
-                    copy.name = format!("{}_{}", copy.name, name(&c.mpn));
-                }
-                o.push_str(&symbol(c, &copy, nickname, variant_map.as_ref().unwrap_or(footprints), policy));
+        for s in &c.symbols {
+            let mut copy = s.clone();
+            if !used.insert(name(&copy.name)) {
+                copy.name = format!("{}_{}", copy.name, name(&c.mpn));
             }
+            o.push_str(&symbol(c, &copy, nickname, footprints, policy));
         }
     }
     o.push_str(")\n");
@@ -209,6 +185,14 @@ fn graphic_bounds(gs: &[Graphic]) -> Option<(i64, i64, i64, i64)> {
         }
     }
     b
+}
+fn physical_graphic(g: &Graphic) -> bool {
+    let layer = match g {
+        Graphic::Line { layer, .. } | Graphic::Arc { layer, .. } | Graphic::Circle { layer, .. } |
+        Graphic::Rectangle { layer, .. } | Graphic::Polygon { layer, .. } | Graphic::Text { layer, .. } => layer,
+    };
+    matches!(layer.to_ascii_uppercase().as_str(), "TOP_ASSEMBLY" | "BOTTOM_ASSEMBLY") &&
+        !matches!(g, Graphic::Text { .. })
 }
 pub fn symbol_bounds(s: &Symbol) -> (i64, i64, i64, i64) {
     let mut b = graphic_bounds(&s.units.iter().flat_map(|u| u.graphics.clone()).collect::<Vec<_>>());
@@ -282,6 +266,7 @@ fn symbol(
         .iter()
         .find_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
         .cloned();
+    let has_footprint = mapped_name.is_some();
     let footprint_value = mapped_name
         .map(|name| format!("{nickname}:{name}"))
         .unwrap_or_default();
@@ -289,6 +274,12 @@ fn symbol(
     o.push_str(&property("Reference", "U", 0.0, layout.1 + 2.54, false));
     o.push_str(&property("Value", &c.mpn, 0.0, -layout.1 - 2.54, false));
     o.push_str(&property("Footprint", &footprint_value, 0.0, 0.0, true));
+    if has_footprint {
+        let filters = c.packages.iter().filter_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
+            .map(|v| format!("{nickname}:{v}*"))
+            .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(" ");
+        if !filters.is_empty() { o.push_str(&property("ki_fp_filters", &filters, 0.0, 0.0, true)); }
+    }
     o.push_str(&property("Datasheet", "", 0.0, 0.0, true));
     o.push_str(&property("Manufacturer", &c.manufacturer, 0.0, 0.0, true));
     o.push_str(&property("MPN", &c.mpn, 0.0, 0.0, true));
@@ -343,7 +334,8 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         bound(pad.position.x_nm-width/2,pad.position.y_nm-height/2);
         bound(pad.position.x_nm+width/2,pad.position.y_nm+height/2);
     }
-    if let Some((a,b,c,d)) = graphic_bounds(&p.graphics) { bound(a,b); bound(c,d); }
+    let physical_graphics = p.graphics.iter().filter(|g| physical_graphic(g)).cloned().collect::<Vec<_>>();
+    if let Some((a,b,c,d)) = graphic_bounds(&physical_graphics) { bound(a,b); bound(c,d); }
     if min_x == i64::MAX { min_x = -500_000; min_y = -500_000; max_x = 500_000; max_y = 500_000; }
     o.push_str(&format!("  (fp_text reference \"REF**\" (at {} {} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{}\" (at {} {} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))\n",mm((min_x+max_x)/2),mm(max_y+2_000_000),esc(&p.name),mm((min_x+max_x)/2),mm(min_y-2_000_000)));
     for g in &p.graphics {
@@ -661,7 +653,7 @@ mod tests {
         ], ..Default::default() };
         let out = footprint(&EdaComponent::default(), &p);
         for token in ["(fp_line ","(fp_arc ","(fp_circle ","(fp_rect ","(fp_poly ","(fp_text user "] { assert!(out.contains(token), "missing {token}"); }
-        assert!(out.contains("(fp_text reference \"REF**\" (at 0 3"));
-        assert!(out.contains("(fp_text value \"G\" (at 0 -3"));
+        assert!(out.contains("(fp_text reference \"REF**\" (at 0 2.5"));
+        assert!(out.contains("(fp_text value \"G\" (at 0 -2.5"));
     }
 }
