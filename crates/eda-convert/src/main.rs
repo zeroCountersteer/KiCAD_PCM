@@ -955,7 +955,7 @@ fn kicad_generate(
     } else { None };
     if let Some(p) = input {
         paths.push(p)
-    } else if all && manufacturer.as_deref() == Some("ti") {
+    } else if (all || wanted.is_some()) && manufacturer.as_deref() == Some("ti") {
         let mut expected = current_ti_component_paths(data)?;
         if let Some(wanted) = &wanted {
             expected.retain(|p| {
@@ -1039,12 +1039,11 @@ fn kicad_generate(
     } else {
         None
     };
-    let mut footprint_map = production_footprint_map(&all_components, dedupe.as_ref())?;
+    let footprint_map = production_footprint_map(&all_components, dedupe.as_ref())?;
     for c in &all_components {
         let keys = c.packages.iter().filter(|p| matches!(eda_model::footprint_eligibility(p), eda_model::FootprintEligibility::Eligible)).map(|p| format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)).collect::<Vec<_>>();
         let names = keys.iter().filter_map(|k| footprint_map.get(k)).cloned().collect::<BTreeSet<_>>();
         if names.len() > 1 {
-            for key in keys { footprint_map.remove(&key); }
             report.push_str(&format!("* {}: ambiguous footprint assignment; canonical choices: {}\n", c.mpn, names.into_iter().collect::<Vec<_>>().join(", ")));
         } else if names.is_empty() {
             report.push_str(&format!("* {}: no eligible production footprint assignment\n", c.mpn));
@@ -1101,16 +1100,22 @@ fn kicad_generate(
                     safe(&p.name)
                 };
                 let output = fpdir.join(format!("{out_name}.kicad_mod"));
+                let model = if with_3d {
+                    find_ti_model(data, c, p, &model_dir)?
+                } else {
+                    None
+                };
+                report.push_str(&format!(
+                    "* model {} / {}: {}\n",
+                    c.mpn,
+                    out_name,
+                    model.as_deref().unwrap_or("none; no unambiguous vendor STEP")
+                ));
                 if !deduplicated || !output.exists() {
                     let mut pp = p.clone();
                     if deduplicated {
                         pp.name = out_name.clone();
                     }
-                    let model = if with_3d {
-                        find_ti_model(data, c, p, &model_dir)?
-                    } else {
-                        None
-                    };
                     fs::write(
                         output,
                         kicad::footprint_with_model(c, &pp, model.as_deref()),
@@ -1255,17 +1260,19 @@ fn find_ti_model(
         return Ok(None);
     };
     let package_code = ti_package_code(&p.name);
-    for line in fs::read_to_string(data.join("manifests/texas-instruments.jsonl"))
+    let manifests = fs::read_to_string(data.join("manifests/texas-instruments.jsonl"))
         .unwrap_or_default()
         .lines()
-    {
-        let m: ManifestRecord = serde_json::from_str(line)?;
-        if m.mpn != c.mpn
-            || !matches!(m.format.as_str(), "stp" | "step")
-            || ti_model_code(&m.filename) != package_code
-        {
-            continue;
-        }
+        .map(serde_json::from_str::<ManifestRecord>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let exact = manifests.iter().filter(|m| {
+        m.mpn == c.mpn && matches!(m.format.as_str(), "stp" | "step") && ti_model_code(&m.filename) == package_code
+    }).collect::<Vec<_>>();
+    let package_matches = manifests.iter().filter(|m| {
+        matches!(m.format.as_str(), "stp" | "step") && ti_model_code(&m.filename) == package_code
+    }).collect::<Vec<_>>();
+    let candidates = if exact.len() == 1 { exact } else if exact.is_empty() && package_matches.len() == 1 { package_matches } else { Vec::new() };
+    for m in candidates {
         let src = data
             .join("objects")
             .join(&m.sha256[..2])
@@ -1292,7 +1299,7 @@ fn find_ti_model(
             fs::write(&target, bytes)?
         }
         return Ok(Some(format!(
-            "${{PERSONAL_KICAD_LIB}}/3dmodels/Personal_Packages.3dshapes/{filename}"
+            "${{KICAD10_3RD_PARTY}}/3dmodels/com_github_kicad-pcm_ti-quality-preview/Personal_Packages.3dshapes/{filename}"
         )));
     }
     Ok(None)
@@ -1472,6 +1479,7 @@ fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str)
     if !library_prefix.ends_with('_') { anyhow::bail!("library prefix must end with underscore"); }
     let symdir = input.join("symbols");
     let fpdir = input.join("footprints");
+    let modeldir = input.join("3dmodels");
     if !symdir.is_dir() || !fpdir.is_dir() { anyhow::bail!("input lacks symbols or footprints"); }
     let expected_nickname = format!("{}Personal_Packages", library_prefix);
     let mut footprint_names = BTreeSet::new();
@@ -1480,6 +1488,14 @@ fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str)
             let rel = e.path().strip_prefix(&fpdir)?;
             if rel.components().count() != 2 { anyhow::bail!("invalid footprint path {}", rel.display()); }
             footprint_names.insert(e.file_name().to_string_lossy().trim_end_matches(".kicad_mod").to_owned());
+        }
+    }
+    let mut model_names = BTreeSet::new();
+    if modeldir.is_dir() {
+        for e in walkdir::WalkDir::new(&modeldir).into_iter().filter_map(Result::ok) {
+            if e.path().extension().is_some_and(|x| x == "step" || x == "stp") {
+                model_names.insert(e.file_name().to_string_lossy().into_owned());
+            }
         }
     }
     for e in walkdir::WalkDir::new(&symdir).into_iter().filter_map(Result::ok) {
@@ -1492,6 +1508,14 @@ fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str)
             if nick != expected_nickname { anyhow::bail!("wrong footprint prefix {nick}, expected {expected_nickname}"); }
             if !footprint_names.contains(name) { anyhow::bail!("dangling footprint reference {value}"); }
         }
+        for line in text.lines().filter(|x| x.contains("(model \"")) {
+            let value = line.split('"').nth(1).unwrap_or("");
+            if value.starts_with('/') || value.contains("data/generated") || value.contains("target/") {
+                anyhow::bail!("invalid local model reference {value}");
+            }
+            let filename = Path::new(value).file_name().and_then(|x| x.to_str()).unwrap_or("");
+            if !model_names.contains(filename) { anyhow::bail!("dangling model reference {value}"); }
+        }
     }
     if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
     let file = fs::File::create(output)?;
@@ -1500,7 +1524,7 @@ fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str)
     zip.start_file("metadata.json", opts)?;
     zip.write_all(format!("{}\n", serde_json::to_string_pretty(&metadata)?).as_bytes())?;
     let mut paths = Vec::new();
-    for base in ["symbols", "footprints"] {
+    for base in ["symbols", "footprints", "3dmodels"] {
         for e in walkdir::WalkDir::new(input.join(base)).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
             paths.push(e.path().to_owned());
         }

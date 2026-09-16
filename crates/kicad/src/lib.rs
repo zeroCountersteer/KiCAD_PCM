@@ -131,12 +131,36 @@ pub fn symbol_lib_many_with_policy(
         format!("(kicad_symbol_lib (version {KICAD_VERSION}) (generator \"kicad_symbol_editor\") (generator_version \"10.0\")\n");
     let mut used = BTreeSet::new();
     for c in cs {
-        for s in &c.symbols {
-            let mut copy = s.clone();
-            if !used.insert(name(&copy.name)) {
-                copy.name = format!("{}_{}", copy.name, name(&c.mpn));
+        let choices = c
+            .packages
+            .iter()
+            .filter_map(|p| footprints.get(&format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let variants = if choices.len() > 1 {
+            choices.into_iter().map(Some).collect::<Vec<_>>()
+        } else {
+            vec![None]
+        };
+        for variant in variants {
+            let selected = variant.as_deref();
+            let variant_map = selected.map(|wanted| {
+                c.packages.iter().filter_map(|p| {
+                    let key = format!("{}|{}|{}", c.manufacturer, c.mpn, p.name);
+                    (footprints.get(&key).is_some_and(|x| x == wanted))
+                        .then(|| (key, wanted.to_owned()))
+                }).collect::<std::collections::BTreeMap<_, _>>()
+            });
+            for s in &c.symbols {
+                let mut copy = s.clone();
+                if let Some(wanted) = selected {
+                    copy.name = format!("{}__{}", copy.name, name(wanted));
+                }
+                if !used.insert(name(&copy.name)) {
+                    copy.name = format!("{}_{}", copy.name, name(&c.mpn));
+                }
+                o.push_str(&symbol(c, &copy, nickname, variant_map.as_ref().unwrap_or(footprints), policy));
             }
-            o.push_str(&symbol(c, &copy, nickname, footprints, policy));
         }
     }
     o.push_str(")\n");
@@ -217,10 +241,10 @@ fn generated_pins(u: &eda_model::SymbolUnit, half_w: f64, half_h: f64) -> Vec<(e
     let mut groups: [Vec<eda_model::Pin>; 4] = [Vec::new(),Vec::new(),Vec::new(),Vec::new()];
     for p in &u.pins { groups[pin_side(p) as usize].push(p.clone()); }
     let mut out = Vec::new();
-    for (i,p) in groups[0].clone().into_iter().enumerate() { let y=(i as f64-(groups[0].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,-half_w-2.54,y,180)); }
-    for (i,p) in groups[1].clone().into_iter().enumerate() { let y=(i as f64-(groups[1].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,half_w+2.54,y,0)); }
-    for (i,p) in groups[2].clone().into_iter().enumerate() { let x=(i as f64-(groups[2].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,half_h+2.54,90)); }
-    for (i,p) in groups[3].clone().into_iter().enumerate() { let x=(i as f64-(groups[3].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,-half_h-2.54,270)); }
+    for (i,p) in groups[0].clone().into_iter().enumerate() { let y=(i as f64-(groups[0].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,-half_w-2.54,y,0)); }
+    for (i,p) in groups[1].clone().into_iter().enumerate() { let y=(i as f64-(groups[1].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,half_w+2.54,y,180)); }
+    for (i,p) in groups[2].clone().into_iter().enumerate() { let x=(i as f64-(groups[2].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,half_h+2.54,270)); }
+    for (i,p) in groups[3].clone().into_iter().enumerate() { let x=(i as f64-(groups[3].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,-half_h-2.54,90)); }
     out
 }
 fn arc_mid(center: &eda_model::Point, start: &eda_model::Point, end: &eda_model::Point) -> (i64, i64) {
@@ -313,13 +337,31 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
     }
     let mut min_x = i64::MAX; let mut min_y = i64::MAX; let mut max_x = i64::MIN; let mut max_y = i64::MIN;
     let mut bound = |x: i64, y: i64| { min_x=min_x.min(x); min_y=min_y.min(y); max_x=max_x.max(x); max_y=max_y.max(y); };
-    for pad in &p.pads { bound(pad.position.x_nm-pad.size.x_nm/2,pad.position.y_nm-pad.size.y_nm/2); bound(pad.position.x_nm+pad.size.x_nm/2,pad.position.y_nm+pad.size.y_nm/2); }
+    for pad in &p.pads {
+        let quarter_turn = pad.rotation_mdeg.rem_euclid(180000) == 90000;
+        let (width, height) = if quarter_turn { (pad.size.y_nm, pad.size.x_nm) } else { (pad.size.x_nm, pad.size.y_nm) };
+        bound(pad.position.x_nm-width/2,pad.position.y_nm-height/2);
+        bound(pad.position.x_nm+width/2,pad.position.y_nm+height/2);
+    }
     if let Some((a,b,c,d)) = graphic_bounds(&p.graphics) { bound(a,b); bound(c,d); }
     if min_x == i64::MAX { min_x = -500_000; min_y = -500_000; max_x = 500_000; max_y = 500_000; }
     o.push_str(&format!("  (fp_text reference \"REF**\" (at {} {} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{}\" (at {} {} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))\n",mm((min_x+max_x)/2),mm(max_y+2_000_000),esc(&p.name),mm((min_x+max_x)/2),mm(min_y-2_000_000)));
     for g in &p.graphics {
         if let Some(out) = footprint_graphic(g) { o.push_str(&out); }
     }
+    let clearance = 250_000i64;
+    let snap_min = |n: i64| (n.div_euclid(10_000)) * 10_000;
+    let snap_max = |n: i64| ((n + 9_999).div_euclid(10_000)) * 10_000;
+    let (cx0, cy0, cx1, cy1) = (
+        snap_min(min_x - clearance),
+        snap_min(min_y - clearance),
+        snap_max(max_x + clearance),
+        snap_max(max_y + clearance),
+    );
+    o.push_str(&format!(
+        "  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.05) (type default)) (fill none) (layer \"F.CrtYd\"))\n",
+        mm(cx0), mm(cy0), mm(cx1), mm(cy1)
+    ));
     for x in &p.pads {
         if x.drill.is_some() && x.plated.is_none() {
             o.push_str(&format!(
@@ -565,6 +607,46 @@ mod tests {
         assert!(out.contains("(property \"Reference\" \"U\" (at 0.000000 6.350000 0)"));
         assert!(out.contains("(property \"Value\" \"G\" (at 0.000000 -6.350000 0)"));
         assert!(out.contains("(property \"Footprint\" \"\" (at 0.000000 0.000000 0) (effects (font (size 1.27 1.27)) hide))"));
+    }
+
+    #[test]
+    fn generated_pin_connections_reach_box_edges() {
+        let unit = eda_model::SymbolUnit {
+            pins: vec![
+                eda_model::Pin { number: "L".into(), orientation_mdeg: 180000, ..Default::default() },
+                eda_model::Pin { number: "R".into(), orientation_mdeg: 0, ..Default::default() },
+                eda_model::Pin { number: "T".into(), orientation_mdeg: 90000, ..Default::default() },
+                eda_model::Pin { number: "B".into(), orientation_mdeg: 270000, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let (half_w, half_h) = generated_layout(&Symbol { units: vec![unit.clone()], ..Default::default() });
+        for (pin, x, y, angle) in generated_pins(&unit, half_w, half_h) {
+            let length = 2.54;
+            let radians = (angle as f64).to_radians();
+            let end = (x + radians.cos() * length, y + radians.sin() * length);
+            assert!(x.abs() > half_w || y.abs() > half_h);
+            match pin.number.as_str() {
+                "L" => { assert_eq!(angle, 0); assert!((end.0 + half_w).abs() < 1e-9); }
+                "R" => { assert_eq!(angle, 180); assert!((end.0 - half_w).abs() < 1e-9); }
+                "T" => { assert_eq!(angle, 270); assert!((end.1 - half_h).abs() < 1e-9); }
+                "B" => { assert_eq!(angle, 90); assert!((end.1 + half_h).abs() < 1e-9); }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn every_emitted_footprint_has_closed_courtyard() {
+        let package = Package {
+            name: "COURTYARD".into(),
+            pads: vec![eda_model::Pad { number: "1".into(), size: Point { x_nm: 1_000_000, y_nm: 2_000_000 }, rotation_mdeg: 90000, ..Default::default() }],
+            ..Default::default()
+        };
+        let out = footprint(&EdaComponent::default(), &package);
+        assert_eq!(out.matches("(fp_rect ").count(), 1);
+        assert!(out.contains("(width 0.05)"));
+        assert!(out.contains("(layer \"F.CrtYd\")"));
     }
 
     #[test]

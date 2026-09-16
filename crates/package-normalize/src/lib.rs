@@ -321,7 +321,7 @@ fn kicad_layer(layer: &str) -> String {
     .into()
 }
 fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> serde_json::Value {
-    let pads = pads
+    let pad_projection = pads
         .iter()
         .filter(|p| p.kind != "unknown_drill_plating")
         .map(|p| {
@@ -349,11 +349,21 @@ fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> s
             })
         })
         .collect::<Vec<_>>();
-    let graphics = graphics
+    let graphic_projection = graphics
         .iter()
         .map(|g| serde_json::json!({"kind": g.kind, "data": g.data, "width": g.width_nm, "height": g.height_nm, "fill": g.fill, "text": g.text, "layer": kicad_layer(&g.layer)}))
         .collect::<Vec<_>>();
-    serde_json::json!({"pads": pads, "graphics": graphics})
+    let b = bounds(pads, graphics);
+    let clearance = 250_000i64;
+    let floor_grid = |n: i64| n.div_euclid(10_000) * 10_000;
+    let ceil_grid = |n: i64| (n + 9_999).div_euclid(10_000) * 10_000;
+    let courtyard = [
+        floor_grid(b.min_x_nm - clearance),
+        floor_grid(b.min_y_nm - clearance),
+        ceil_grid(b.max_x_nm + clearance),
+        ceil_grid(b.max_y_nm + clearance),
+    ];
+    serde_json::json!({"pads": pad_projection, "graphics": graphic_projection, "courtyard": courtyard})
 }
 fn kicad_groups(packages: &[NormalizedPackage]) -> BTreeMap<String, Vec<String>> {
     let mut groups = BTreeMap::new();

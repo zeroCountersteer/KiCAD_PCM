@@ -1,0 +1,5 @@
+{
+  "upstream": "https://gitlab.com/kicad/libraries/kicad-library-tools.git",
+  "commit": "dc0794c84de208cd739d54cb95dc6cb08ebe770f",
+  "tooling": "Current KiCad library-tools snapshot inspected for 0.1.4; preview uses authoritative TI STEP assets where available."
+}
