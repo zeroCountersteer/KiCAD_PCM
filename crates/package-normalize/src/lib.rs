@@ -27,6 +27,10 @@ pub struct NormalizedGraphic {
     pub text: Option<String>,
     #[serde(default)]
     pub width_nm: i64,
+    #[serde(default)]
+    pub height_nm: i64,
+    #[serde(default)]
+    pub fill: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Bounds {
@@ -134,41 +138,49 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                 data: vec![start.x_nm, start.y_nm, end.x_nm, end.y_nm],
                 text: None,
                 width_nm: *width_nm,
+                height_nm: 0,
+                fill: false,
             },
             Graphic::Circle {
                 center,
                 radius_nm,
+                width_nm,
                 layer,
-                ..
             } => NormalizedGraphic {
                 kind: "circle".into(),
                 layer: layer.clone(),
                 data: vec![center.x_nm, center.y_nm, *radius_nm],
                 text: None,
-                width_nm: 0,
+                width_nm: *width_nm,
+                height_nm: 0,
+                fill: false,
             },
             Graphic::Rectangle {
-                start, end, layer, ..
+                start, end, layer, fill, width_nm
             } => NormalizedGraphic {
                 kind: "rectangle".into(),
                 layer: layer.clone(),
                 data: vec![start.x_nm, start.y_nm, end.x_nm, end.y_nm],
                 text: None,
-                width_nm: 0,
+                width_nm: *width_nm,
+                height_nm: 0,
+                fill: *fill,
             },
-            Graphic::Polygon { points, layer, .. } => NormalizedGraphic {
+            Graphic::Polygon { points, layer, fill, width_nm, .. } => NormalizedGraphic {
                 kind: "polygon".into(),
                 layer: layer.clone(),
                 data: points.iter().flat_map(|x| [x.x_nm, x.y_nm]).collect(),
                 text: None,
-                width_nm: 0,
+                width_nm: *width_nm,
+                height_nm: 0,
+                fill: *fill,
             },
             Graphic::Arc {
                 center,
                 start,
                 end,
                 layer,
-                ..
+                width_nm,
             } => NormalizedGraphic {
                 kind: "arc".into(),
                 layer: layer.clone(),
@@ -181,19 +193,25 @@ fn graphics(p: &Package) -> Vec<NormalizedGraphic> {
                     end.y_nm,
                 ],
                 text: None,
-                width_nm: 0,
+                width_nm: *width_nm,
+                height_nm: 0,
+                fill: false,
             },
             Graphic::Text {
                 text,
                 position,
                 layer,
+                height_nm,
+                width_nm,
                 ..
             } => NormalizedGraphic {
                 kind: "text".into(),
                 layer: layer.clone(),
                 data: vec![position.x_nm, position.y_nm],
                 text: Some(text.clone()),
-                width_nm: 0,
+                width_nm: *width_nm,
+                height_nm: *height_nm,
+                fill: false,
             },
         })
         .collect()
@@ -333,8 +351,7 @@ fn kicad_projection(pads: &[NormalizedPad], graphics: &[NormalizedGraphic]) -> s
         .collect::<Vec<_>>();
     let graphics = graphics
         .iter()
-        .filter(|g| g.kind == "line")
-        .map(|g| serde_json::json!({"data": g.data, "width": g.width_nm, "layer": kicad_layer(&g.layer)}))
+        .map(|g| serde_json::json!({"kind": g.kind, "data": g.data, "width": g.width_nm, "height": g.height_nm, "fill": g.fill, "text": g.text, "layer": kicad_layer(&g.layer)}))
         .collect::<Vec<_>>();
     serde_json::json!({"pads": pads, "graphics": graphics})
 }
