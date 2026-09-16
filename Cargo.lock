@@ -461,6 +461,7 @@ dependencies = [
  "tempfile",
  "vendor-ti",
  "walkdir",
+ "zip",
 ]
 
 [[package]]

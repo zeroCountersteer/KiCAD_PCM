@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write as IoWrite},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     thread,
@@ -50,6 +50,18 @@ enum Command {
         deduplicated: bool,
         #[arg(long)]
         with_3d: bool,
+        #[arg(long)]
+        mpn_file: Option<PathBuf>,
+        #[arg(long, default_value = "PCM_Personal_Packages")]
+        footprint_nickname: String,
+    },
+    PcmPackage {
+        input: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = "PCM_")]
+        library_prefix: String,
     },
     PackageDiff {
         left: String,
@@ -114,6 +126,8 @@ fn main() -> Result<()> {
             nickname,
             deduplicated,
             with_3d,
+            mpn_file,
+            footprint_nickname,
         } => kicad_generate(
             &c.data,
             mpn,
@@ -124,7 +138,11 @@ fn main() -> Result<()> {
             &nickname,
             deduplicated,
             with_3d,
+            mpn_file.as_deref(),
+            &footprint_nickname,
         ),
+        Command::PcmPackage { input, output, version, library_prefix } =>
+            pcm_package(&input, &output, &version, &library_prefix),
         Command::PackageDiff { left, right, json } => package_diff(&c.data, &left, &right, json),
         Command::PackageDedupe { manufacturer } => package_dedupe(&c.data, manufacturer.as_deref()),
         Command::SymbolCheck { manufacturer, mpn } => {
@@ -912,6 +930,8 @@ fn kicad_generate(
     nickname: &str,
     deduplicated: bool,
     with_3d: bool,
+    mpn_file: Option<&Path>,
+    footprint_nickname: &str,
 ) -> Result<()> {
     let root = data.join("generated/kicad");
     if clean && root.exists() {
@@ -923,10 +943,23 @@ fn kicad_generate(
         fs::create_dir_all(&model_dir)?;
     }
     let mut paths = Vec::new();
+    let wanted = if let Some(file) = mpn_file {
+        let set = parse_mpn_file(file)?;
+        if manufacturer.as_deref() == Some("ti") {
+            let current = load_current_ti_bxl_corpus(data)?;
+            let known = current.assets.iter().flat_map(|a| a.references.iter().map(|r| r.mpn.clone())).collect::<BTreeSet<_>>();
+            let unknown = set.difference(&known).cloned().collect::<Vec<_>>();
+            if !unknown.is_empty() { anyhow::bail!("unknown current TI MPN(s): {}", unknown.join(", ")); }
+        }
+        Some(set)
+    } else { None };
     if let Some(p) = input {
         paths.push(p)
     } else if all && manufacturer.as_deref() == Some("ti") {
-        let expected = current_ti_component_paths(data)?;
+        let mut expected = current_ti_component_paths(data)?;
+        if let Some(wanted) = &wanted {
+            expected.retain(|p| p.file_stem().is_some_and(|s| wanted.contains(s.to_string_lossy().as_ref())));
+        }
         let missing = expected
             .iter()
             .filter(|path| !path.is_file())
@@ -954,6 +987,7 @@ fn kicad_generate(
         if !all && mpn.as_deref().is_some_and(|x| x != c.mpn) {
             continue;
         }
+        if wanted.as_ref().is_some_and(|set| !set.contains(&c.mpn)) { continue; }
         if manufacturer
             .as_deref()
             .is_some_and(|x| x != "ti" && x != c.manufacturer)
@@ -1004,7 +1038,7 @@ fn kicad_generate(
             kicad::symbol_lib_many_with_footprints(
                 &items,
                 if deduplicated {
-                    "Personal_Packages"
+                    footprint_nickname
                 } else {
                     nickname
                 },
@@ -1073,6 +1107,17 @@ fn kicad_generate(
     fs::write(root.join("reports/kicad-generation.md"), report)?;
     println!("generated {manufacturer_count} manufacturer libraries");
     Ok(())
+}
+
+fn parse_mpn_file(path: &Path) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for (line_no, line) in fs::read_to_string(path)?.lines().enumerate() {
+        let value = line.split('#').next().unwrap().trim();
+        if !value.is_empty() { out.insert(value.to_owned()); }
+        if line_no > 100_000 { anyhow::bail!("MPN file has too many lines") }
+    }
+    if out.is_empty() { anyhow::bail!("MPN file is empty") }
+    Ok(out)
 }
 fn production_footprint_map(
     components: &[EdaComponent],
@@ -1347,8 +1392,8 @@ fn kicad_check(path: &Path) -> Result<()> {
         .output()
         .is_ok_and(|output| output.status.success());
     if parser_available {
-        let temp = std::env::temp_dir().join(format!("eda-kicad-check-{}", std::process::id()));
-        fs::create_dir_all(&temp)?;
+        let temp = tempfile::Builder::new().prefix("eda-kicad-check-").tempdir()?;
+        let temp_path = temp.path();
         for entry in walkdir::WalkDir::new(path)
             .into_iter()
             .filter_map(Result::ok)
@@ -1361,7 +1406,8 @@ fn kicad_check(path: &Path) -> Result<()> {
             }
             // KiCad's footprint upgrader requires a new output directory; it
             // rejects an already-existing directory as an output collision.
-            let output_dir = temp.join(format!("out-{}", entry.path().to_string_lossy().len()));
+            if is_pretty && fs::read_dir(entry.path())?.next().is_none() { continue; }
+            let output_dir = temp_path.join(format!("out-{}", symbols + footprints + parser_errors));
             let result = if is_sym {
                 std::process::Command::new("kicad-cli")
                     .args(["sym", "upgrade", "--output"])
@@ -1379,12 +1425,74 @@ fn kicad_check(path: &Path) -> Result<()> {
                 parser_errors += 1;
             }
         }
-        let _ = fs::remove_dir_all(temp);
     }
     println!("KiCad validation\n\nSymbol libraries       {symbols}\nFootprints             {footprints}\nS-expression failures  {errors}\nKiCad parser failures  {}\nKiCad parser validation: {}", parser_errors, if parser_available { "performed" } else { "unavailable" });
     if errors > 0 || parser_errors > 0 {
         anyhow::bail!("KiCad syntax validation failed")
     }
+    Ok(())
+}
+
+fn pcm_package(input: &Path, output: &Path, version: &str, library_prefix: &str) -> Result<()> {
+    let metadata = serde_json::json!({
+        "$schema": "https://go.kicad.org/pcm/schemas/v2",
+        "name": "KiCAD_PCM TI Quality Preview",
+        "description": "Development preview of generated Texas Instruments KiCad symbols and footprints.",
+        "description_full": "Development and evaluation package generated from current Texas Instruments BXL assets. Content quality requires user review. No redistribution rights beyond applicable source terms are asserted.",
+        "identifier": "com.github.kicad-pcm.ti-quality-preview",
+        "type": "library",
+        "author": {"name": "KiCAD_PCM", "contact": {"homepage": "https://github.com/"}},
+        "license": "proprietary-source-data-development-evaluation",
+        "resources": {"homepage": "https://github.com/"},
+        "versions": [{"version": version, "status": "development", "kicad_version": "10.0"}]
+    });
+    if !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        anyhow::bail!("PCM v2 schema requires numeric version, got {version}");
+    }
+    if !library_prefix.ends_with('_') { anyhow::bail!("library prefix must end with underscore"); }
+    let symdir = input.join("symbols");
+    let fpdir = input.join("footprints");
+    if !symdir.is_dir() || !fpdir.is_dir() { anyhow::bail!("input lacks symbols or footprints"); }
+    let expected_nickname = format!("{}Personal_Packages", library_prefix);
+    let mut footprint_names = BTreeSet::new();
+    for e in walkdir::WalkDir::new(&fpdir).into_iter().filter_map(Result::ok) {
+        if e.path().extension().is_some_and(|x| x == "kicad_mod") {
+            let rel = e.path().strip_prefix(&fpdir)?;
+            if rel.components().count() != 2 { anyhow::bail!("invalid footprint path {}", rel.display()); }
+            footprint_names.insert(e.file_name().to_string_lossy().trim_end_matches(".kicad_mod").to_owned());
+        }
+    }
+    for e in walkdir::WalkDir::new(&symdir).into_iter().filter_map(Result::ok) {
+        if !e.path().extension().is_some_and(|x| x == "kicad_sym") { continue; }
+        let text = fs::read_to_string(e.path())?;
+        for line in text.lines().filter(|x| x.contains("(property \"Footprint\"")) {
+            let value = line.split('\"').nth(3).unwrap_or("");
+            if value.is_empty() { continue; }
+            let Some((nick, name)) = value.split_once(':') else { anyhow::bail!("invalid footprint reference {value}"); };
+            if nick != expected_nickname { anyhow::bail!("wrong footprint prefix {nick}, expected {expected_nickname}"); }
+            if !footprint_names.contains(name) { anyhow::bail!("dangling footprint reference {value}"); }
+        }
+    }
+    if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
+    let file = fs::File::create(output)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("metadata.json", opts)?;
+    zip.write_all(format!("{}\n", serde_json::to_string_pretty(&metadata)?).as_bytes())?;
+    let mut paths = Vec::new();
+    for base in ["symbols", "footprints"] {
+        for e in walkdir::WalkDir::new(input.join(base)).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
+            paths.push(e.path().to_owned());
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let rel = path.strip_prefix(input)?.to_string_lossy().replace('\\', "/");
+        zip.start_file(rel, opts)?;
+        zip.write_all(&fs::read(path)?)?;
+    }
+    zip.finish()?;
+    println!("created {}", output.display());
     Ok(())
 }
 fn symbol_check(data: &Path, manufacturer: Option<&str>, wanted: Option<&str>) -> Result<()> {
@@ -1652,6 +1760,28 @@ mod tests {
             fs::write(path.join(format!("{hash}.bxl")), b"object").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn mpn_file_parser_deduplicates_comments_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mpns.txt");
+        fs::write(&path, "# edge\nA\n\nB # note\nA\n").unwrap();
+        assert_eq!(parse_mpn_file(&path).unwrap().into_iter().collect::<Vec<_>>(), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn pcm_package_places_metadata_at_archive_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("input/symbols")).unwrap();
+        fs::create_dir_all(dir.path().join("input/footprints/Personal_Packages.pretty")).unwrap();
+        fs::write(dir.path().join("input/symbols/Test.kicad_sym"), "(kicad_symbol_lib (version 20231120))\n").unwrap();
+        let output = dir.path().join("out.zip");
+        pcm_package(&dir.path().join("input"), &output, "0.1.0", "PCM_").unwrap();
+        let file = fs::File::open(output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("metadata.json").is_ok());
+        assert!(archive.by_name("input/metadata.json").is_err());
     }
 
     #[test]
