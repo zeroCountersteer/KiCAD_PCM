@@ -6,7 +6,7 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
-pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v3";
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v4";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section { None, Pattern, Symbol }
 fn normalize_layer(raw: &str) -> String {
@@ -108,6 +108,7 @@ pub fn canonicalize(
     let pat = Regex::new(r#"^\s*Pattern\s+"([^"]+)""#).unwrap();
     let sym = Regex::new(r#"^\s*Symbol\s+"([^"]+)""#).unwrap();
     let pad=Regex::new(r#"Pad\s+\(Number\s+([^\)]+)\)\s+\(PinName\s+"([^"]*)"\)\s+\(PadStyle\s+"([^"]+)"\).*?\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)"#).unwrap();
+    let pad_rotate_re = Regex::new(r#"\(Rotate\s+([-0-9.]+)\)"#).unwrap();
     let pin=Regex::new(r#"Pin\s+\(PinNum\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(PinLength\s+([-0-9.]+)\)"#).unwrap();
     let rotate_re = Regex::new(r#"\(Rotate\s+([-0-9.]+)\)"#).unwrap();
     let pname = Regex::new(r#"PinName\s+"([^"]*)""#).unwrap();
@@ -191,6 +192,7 @@ pub fn canonicalize(
                     // declaration. Leave plating unknown unless an explicit
                     // source attribute is decoded.
                     plated: None,
+                    rotation_mdeg: pad_rotate_re.captures(line).and_then(|x| x[1].parse::<f64>().ok()).unwrap_or(0.0) as i32 * 1000,
                     ..Default::default()
                 })
             }
@@ -377,5 +379,20 @@ EndSymbol
         assert!(!c.symbols[0].units[0].pins[0].visible);
         assert!(c.symbols[0].units[0].pins[0].source_semantics.flags.iter().any(|x| x == "Hidden"));
         assert_eq!(c.symbols[0].units[0].pins[0].orientation_mdeg, 180000);
+    }
+
+    #[test]
+    fn preserves_pad_rotation_without_swapping_local_dimensions() {
+        let doc = BxlDocument { version: None, records: Vec::new(), raw_text: Some(r#"
+PadStack "S"
+ PadShape "Rectangle" (Width 10) (Height 20) (Layer TOP)
+EndPadStack
+Pattern "DCQ"
+ Pad (Number 1) (PinName "1") (PadStyle "S") (Origin 0, 0) (Rotate 90)
+EndPattern
+"#.into()) };
+        let c = canonicalize(&doc, "TI", "X", None);
+        let p = &c.packages[0].pads[0];
+        assert_eq!((p.size.x_nm, p.size.y_nm, p.rotation_mdeg), (254000, 508000, 90000));
     }
 }

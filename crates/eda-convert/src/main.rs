@@ -1011,6 +1011,11 @@ fn kicad_generate(
         errors += v.errors.len();
         let mismatches = kicad::check_pin_pad(&c);
         warnings += mismatches.len();
+        for p in &c.packages {
+            let overlaps = kicad::pad_overlap_warnings(p);
+            warnings += overlaps.len();
+            for warning in overlaps { report.push_str(&format!("* pad-overlap warning: {warning}\n")); }
+        }
         report.push_str(&format!(
             "* {}: {} symbols, {} packages, {} pin/pad mismatches, {} warnings, {} errors\n",
             c.mpn,
@@ -1029,7 +1034,17 @@ fn kicad_generate(
     } else {
         None
     };
-    let footprint_map = production_footprint_map(&all_components, dedupe.as_ref())?;
+    let mut footprint_map = production_footprint_map(&all_components, dedupe.as_ref())?;
+    for c in &all_components {
+        let keys = c.packages.iter().filter(|p| matches!(eda_model::footprint_eligibility(p), eda_model::FootprintEligibility::Eligible)).map(|p| format!("{}|{}|{}", c.manufacturer, c.mpn, p.name)).collect::<Vec<_>>();
+        let names = keys.iter().filter_map(|k| footprint_map.get(k)).cloned().collect::<BTreeSet<_>>();
+        if names.len() > 1 {
+            for key in keys { footprint_map.remove(&key); }
+            report.push_str(&format!("* {}: ambiguous footprint assignment; canonical choices: {}\n", c.mpn, names.into_iter().collect::<Vec<_>>().join(", ")));
+        } else if names.is_empty() {
+            report.push_str(&format!("* {}: no eligible production footprint assignment\n", c.mpn));
+        }
+    }
     for (man, items) in by_m {
         let symdir = root.join("symbols");
         fs::create_dir_all(&symdir)?;

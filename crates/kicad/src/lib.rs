@@ -1,6 +1,8 @@
 use eda_model::{EdaComponent, ElectricalType, Graphic, Package, Symbol};
 use std::{collections::BTreeSet, fmt::Write};
 pub const KICAD_VERSION: &str = "20231120";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolRendering { SourceGeometry, GeneratedBox }
 #[derive(Debug, Default, Clone)]
 pub struct Validation {
     pub warnings: Vec<String>,
@@ -106,18 +108,24 @@ pub fn symbol_lib(c: &EdaComponent, nickname: &str) -> String {
     let mut o =
         format!("(kicad_symbol_lib (version {KICAD_VERSION}) (generator \"kicad_symbol_editor\") (generator_version \"10.0\")\n");
     for s in &c.symbols {
-        o.push_str(&symbol(c, s, nickname, &std::collections::BTreeMap::new()));
+        o.push_str(&symbol(c, s, nickname, &std::collections::BTreeMap::new(), SymbolRendering::GeneratedBox));
     }
     o.push_str(")\n");
     o
 }
 pub fn symbol_lib_many(cs: &[EdaComponent], nickname: &str) -> String {
-    symbol_lib_many_with_footprints(cs, nickname, &std::collections::BTreeMap::new())
+    symbol_lib_many_with_policy(cs, nickname, &std::collections::BTreeMap::new(), SymbolRendering::GeneratedBox)
 }
 pub fn symbol_lib_many_with_footprints(
     cs: &[EdaComponent],
     nickname: &str,
     footprints: &std::collections::BTreeMap<String, String>,
+) -> String {
+    symbol_lib_many_with_policy(cs, nickname, footprints, SymbolRendering::GeneratedBox)
+}
+pub fn symbol_lib_many_with_policy(
+    cs: &[EdaComponent], nickname: &str,
+    footprints: &std::collections::BTreeMap<String, String>, policy: SymbolRendering,
 ) -> String {
     let mut o =
         format!("(kicad_symbol_lib (version {KICAD_VERSION}) (generator \"kicad_symbol_editor\") (generator_version \"10.0\")\n");
@@ -128,7 +136,7 @@ pub fn symbol_lib_many_with_footprints(
             if !used.insert(name(&copy.name)) {
                 copy.name = format!("{}_{}", copy.name, name(&c.mpn));
             }
-            o.push_str(&symbol(c, &copy, nickname, footprints));
+            o.push_str(&symbol(c, &copy, nickname, footprints, policy));
         }
     }
     o.push_str(")\n");
@@ -188,6 +196,33 @@ pub fn symbol_bounds(s: &Symbol) -> (i64, i64, i64, i64) {
     }}
     b.unwrap_or((0,0,0,0))
 }
+#[derive(Clone, Copy)]
+enum PinSide { Left, Right, Top, Bottom }
+fn pin_side(p: &eda_model::Pin) -> PinSide {
+    match p.orientation_mdeg.rem_euclid(360000) {
+        0 => PinSide::Right, 90000 => PinSide::Top, 180000 => PinSide::Left, 270000 => PinSide::Bottom,
+        _ => match p.electrical_type { ElectricalType::Output | ElectricalType::TriState | ElectricalType::OpenCollector | ElectricalType::OpenEmitter | ElectricalType::PowerOutput => PinSide::Right, ElectricalType::PowerInput => PinSide::Top, _ => PinSide::Left }
+    }
+}
+fn generated_layout(s: &Symbol) -> (f64, f64) {
+    let pins = s.units.iter().flat_map(|u| u.pins.iter());
+    let mut counts = [0usize; 4];
+    let mut longest = 0usize;
+    for p in pins { counts[pin_side(p) as usize] += 1; longest = longest.max(p.name.chars().count()); }
+    let width = (10.16f64.max(longest as f64 * 0.8 + 5.08).max((counts[2]+counts[3]).saturating_sub(1) as f64 * 2.54 + 5.08) / 2.54).ceil() * 2.54;
+    let height = (7.62f64.max((counts[0].max(counts[1]).saturating_sub(1) as f64) * 2.54 + 5.08) / 2.54).ceil() * 2.54;
+    (width / 2.0, height / 2.0)
+}
+fn generated_pins(u: &eda_model::SymbolUnit, half_w: f64, half_h: f64) -> Vec<(eda_model::Pin, f64, f64, i32)> {
+    let mut groups: [Vec<eda_model::Pin>; 4] = [Vec::new(),Vec::new(),Vec::new(),Vec::new()];
+    for p in &u.pins { groups[pin_side(p) as usize].push(p.clone()); }
+    let mut out = Vec::new();
+    for (i,p) in groups[0].clone().into_iter().enumerate() { let y=(i as f64-(groups[0].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,-half_w-2.54,y,180)); }
+    for (i,p) in groups[1].clone().into_iter().enumerate() { let y=(i as f64-(groups[1].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,half_w+2.54,y,0)); }
+    for (i,p) in groups[2].clone().into_iter().enumerate() { let x=(i as f64-(groups[2].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,half_h+2.54,90)); }
+    for (i,p) in groups[3].clone().into_iter().enumerate() { let x=(i as f64-(groups[3].len().saturating_sub(1) as f64)/2.0)*2.54; out.push((p,x,-half_h-2.54,270)); }
+    out
+}
 fn arc_mid(center: &eda_model::Point, start: &eda_model::Point, end: &eda_model::Point) -> (i64, i64) {
     let a = ((start.y_nm-center.y_nm) as f64).atan2((start.x_nm-center.x_nm) as f64);
     let mut d = ((end.y_nm-center.y_nm) as f64).atan2((end.x_nm-center.x_nm) as f64) - a;
@@ -214,6 +249,7 @@ fn symbol(
     s: &Symbol,
     nickname: &str,
     footprints: &std::collections::BTreeMap<String, String>,
+    policy: SymbolRendering,
 ) -> String {
     let sn = name(&s.name);
     let mut o = format!("  (symbol \"{sn}\"\n    (pin_names (offset 1.016))\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n");
@@ -225,9 +261,9 @@ fn symbol(
     let footprint_value = mapped_name
         .map(|name| format!("{nickname}:{name}"))
         .unwrap_or_default();
-    let (_,min_y,_,max_y) = symbol_bounds(s);
-    o.push_str(&property("Reference", "U", 0.0, max_y as f64/1_000_000.0 + 2.54, false));
-    o.push_str(&property("Value", &c.mpn, 0.0, min_y as f64/1_000_000.0 - 2.54, false));
+    let layout = generated_layout(s);
+    o.push_str(&property("Reference", "U", 0.0, layout.1 + 2.54, false));
+    o.push_str(&property("Value", &c.mpn, 0.0, -layout.1 - 2.54, false));
     o.push_str(&property("Footprint", &footprint_value, 0.0, 0.0, true));
     o.push_str(&property("Datasheet", "", 0.0, 0.0, true));
     o.push_str(&property("Manufacturer", &c.manufacturer, 0.0, 0.0, true));
@@ -235,8 +271,9 @@ fn symbol(
     o.push_str(&property("SourceSHA256", c.source_sha256.as_deref().unwrap_or(""), 0.0, 0.0, true));
     for (i, u) in s.units.iter().enumerate() {
         o.push_str(&format!("    (symbol \"{}_{}_1\"\n", sn, i + 1));
-        for g in &u.graphics { if let Some(out) = symbol_graphic(g) { o.push_str(&out); } }
-        for p in &u.pins {
+        if policy == SymbolRendering::SourceGeometry { for g in &u.graphics { if let Some(out) = symbol_graphic(g) { o.push_str(&out); } } }
+        if policy == SymbolRendering::GeneratedBox { o.push_str(&format!("      (rectangle (start -{:.6} {:.6}) (end {:.6} -{:.6}) {} (fill (type background)))\n", layout.0, layout.1, layout.0, layout.1, stroke(254000))); }
+        for (p, x, y, angle) in generated_pins(u, layout.0, layout.1) {
             let et = match p.electrical_type {
                 ElectricalType::Input => "input",
                 ElectricalType::Output => "output",
@@ -251,7 +288,7 @@ fn symbol(
                 ElectricalType::Unknown => "unspecified",
             };
             let hidden = if p.visible { "" } else { " hide" };
-            let _=writeln!(o,"      (pin {et} line{hidden} (at {} {} {}) (length {}) (name \"{}\" (effects (font (size 1.27 1.27)))) (number \"{}\" (effects (font (size 1.27 1.27)))))",mm(p.position.x_nm),mm(p.position.y_nm),angle(p.orientation_mdeg),mm(p.length_nm),esc(&p.name),esc(&p.number));
+            let _=writeln!(o,"      (pin {et} line{hidden} (at {} {} {}) (length 2.54) (name \"{}\" (effects (font (size 1.27 1.27)))) (number \"{}\" (effects (font (size 1.27 1.27)))))",mm((x*1_000_000.0) as i64),mm((y*1_000_000.0) as i64),angle,esc(&p.name),esc(&p.number));
         }
         o.push_str("    )\n");
     }
@@ -393,6 +430,18 @@ pub fn check_pin_pad(c: &EdaComponent) -> Vec<String> {
     }
     w
 }
+pub fn pad_overlap_warnings(p: &Package) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, a) in p.pads.iter().enumerate() { for b in p.pads.iter().skip(i + 1) {
+        if a.number == b.number { continue; }
+        let (aw, ah) = if a.rotation_mdeg.rem_euclid(180000) == 90000 {(a.size.y_nm,a.size.x_nm)} else {(a.size.x_nm,a.size.y_nm)};
+        let (bw, bh) = if b.rotation_mdeg.rem_euclid(180000) == 90000 {(b.size.y_nm,b.size.x_nm)} else {(b.size.x_nm,b.size.y_nm)};
+        let ox = (aw/2 + bw/2 - (a.position.x_nm-b.position.x_nm).abs()).max(0);
+        let oy = (ah/2 + bh/2 - (a.position.y_nm-b.position.y_nm).abs()).max(0);
+        if ox > 0 && oy > 0 { out.push(format!("{}: pads {} and {} overlap by {}x{} nm", p.name, a.number, b.number, ox, oy)); }
+    }}
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,8 +562,8 @@ mod tests {
         let out = symbol_lib_many(&[EdaComponent { mpn:"G".into(), symbols:vec![s], ..Default::default() }], "N");
         assert!(out.contains("(rectangle "));
         assert!(out.contains("(pin unspecified line hide "));
-        assert!(out.contains("(property \"Reference\" \"U\" (at 0.000000 3.540000 0)"));
-        assert!(out.contains("(property \"Value\" \"G\" (at 0.000000 -3.540000 0)"));
+        assert!(out.contains("(property \"Reference\" \"U\" (at 0.000000 6.350000 0)"));
+        assert!(out.contains("(property \"Value\" \"G\" (at 0.000000 -6.350000 0)"));
         assert!(out.contains("(property \"Footprint\" \"\" (at 0.000000 0.000000 0) (effects (font (size 1.27 1.27)) hide))"));
     }
 
