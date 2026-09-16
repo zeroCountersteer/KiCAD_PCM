@@ -6,7 +6,29 @@ use eda_model::{
 };
 use regex::Regex;
 use std::collections::BTreeMap;
-pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v2";
+pub const BXL_CANONICALIZER_VERSION: &str = "ti-bxl-canonical-v3";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section { None, Pattern, Symbol }
+fn normalize_layer(raw: &str) -> String {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "TOP" | "TOP_COPPER" => "TOP_COPPER",
+        "TOP_SILKSCREEN" | "TOP SILKSCREEN" | "SILKSCREEN TOP" => "TOP_SILKSCREEN",
+        "TOP_ASSEMBLY" | "TOP ASSEMBLY" => "TOP_ASSEMBLY",
+        "TOP_SOLDER_MASK" => "TOP_SOLDER_MASK",
+        "TOP_SOLDER_PASTE" | "TOP_PASTE" => "TOP_PASTE",
+        "BOTTOM_SILKSCREEN" | "BOTTOM SILKSCREEN" => "BOTTOM_SILKSCREEN",
+        "BOTTOM_ASSEMBLY" | "BOTTOM ASSEMBLY" => "BOTTOM_ASSEMBLY",
+        "BOTTOM_COPPER" => "BOTTOM_COPPER",
+        other => other,
+    }.into()
+}
+fn add_graphic(c: &mut EdaComponent, package: &mut Option<Package>, graphic: Graphic, _symbol: bool) {
+    if let Some(p) = package.as_mut() {
+        let layer = match &graphic { Graphic::Line { layer, .. } | Graphic::Arc { layer, .. } | Graphic::Circle { layer, .. } | Graphic::Rectangle { layer, .. } | Graphic::Polygon { layer, .. } | Graphic::Text { layer, .. } => layer };
+        if layer == "PRO_E" || layer == "DIMENSION" || layer == "PAD_DIMENSIONS" || layer == "INPUTDIMENSIONS" || layer == "PIN_DETAIL" { c.warnings.push(format!("unmapped package graphic layer: {layer}")); }
+        p.graphics.push(graphic);
+    }
+}
 /// Decompresses the proprietary BXL container using the compatible GPL-3 bxl-rs
 /// implementation. The decoded stream is retained for the next grammar phase.
 pub fn parse(bytes: &[u8]) -> Result<BxlDocument> {
@@ -84,19 +106,24 @@ pub fn canonicalize(
         }
     }
     let pat = Regex::new(r#"^\s*Pattern\s+"([^"]+)""#).unwrap();
-    let sym = Regex::new(r#"Symbol\s+"([^"]+)""#).unwrap();
+    let sym = Regex::new(r#"^\s*Symbol\s+"([^"]+)""#).unwrap();
     let pad=Regex::new(r#"Pad\s+\(Number\s+([^\)]+)\)\s+\(PinName\s+"([^"]*)"\)\s+\(PadStyle\s+"([^"]+)"\).*?\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)"#).unwrap();
-    let pin=Regex::new(r#"Pin\s+\(PinNum\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(PinLength\s+([-0-9.]+)\).*?(?:\(Rotate\s+([-0-9.]+)\))?"#).unwrap();
+    let pin=Regex::new(r#"Pin\s+\(PinNum\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(PinLength\s+([-0-9.]+)\)"#).unwrap();
+    let rotate_re = Regex::new(r#"\(Rotate\s+([-0-9.]+)\)"#).unwrap();
     let pname = Regex::new(r#"PinName\s+"([^"]*)""#).unwrap();
     let raw_type =
         Regex::new(r#"(?:ElectricalType|PinType|Electrical)\s+"?([^\s\)\"]+)"?"#).unwrap();
     let raw_shape = Regex::new(r#"(?:PinShape|Shape)\s+"?([^\s\)\"]+)"?"#).unwrap();
-    let line_re = Regex::new(
-        r#"Line\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(EndPoint\s+([-0-9.]+),\s*([-0-9.]+)\)"#,
-    )
-    .unwrap();
+    let line_re = Regex::new(r#"Line\s+\(Layer\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(EndPoint\s+([-0-9.]+),\s*([-0-9.]+)\)(?:\s+\(Width\s+([-0-9.]+)\))?"#).unwrap();
+    let symbol_line_re = Regex::new(r#"Line\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(EndPoint\s+([-0-9.]+),\s*([-0-9.]+)\)(?:\s+\(Width\s+([-0-9.]+)\))?"#).unwrap();
+    let arc_re = Regex::new(r#"Arc\s+\(Layer\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(Radius\s+([-0-9.]+)\)(?:\s+\(StartAngle\s+([-0-9.]+)\))?\s+\(SweepAngle\s+([-0-9.]+)\)(?:\s+\(Width\s+([-0-9.]+)\))?"#).unwrap();
+    let text_re = Regex::new(r#"Text\s+\(Layer\s+([^\)]+)\)\s+\(Origin\s+([-0-9.]+),\s*([-0-9.]+)\)\s+\(Text\s+"([^"]*)"\).*?\(IsVisible\s+(True|False)\)"#).unwrap();
+    let style_re = Regex::new(r#"TextStyle\s+"([^"]+)"\s+\(FontWidth\s+([-0-9.]+)\)\s+\(FontHeight\s+([-0-9.]+)\)"#).unwrap();
+    let mut styles = BTreeMap::<String, (i64, i64)>::new();
+    for m in style_re.captures_iter(text) { styles.insert(m[1].into(), (mil_nm(&m[2]), mil_nm(&m[3]))); }
+    let mut section = Section::None;
     let mut package = None;
-    let mut symbol = None;
+    let mut symbol: Option<Symbol> = None;
     let mut unit = SymbolUnit {
         name: "unit-1".into(),
         ..Default::default()
@@ -105,6 +132,8 @@ pub fn canonicalize(
     let mut explicit_maps: BTreeMap<String, String> = BTreeMap::new();
     let mut patterns = Vec::new();
     for line in text.lines() {
+        if line.contains("EndPattern") { section = Section::None; if let Some(p) = package.take() { c.packages.push(p); } continue; }
+        if line.contains("EndSymbol") { section = Section::None; if let Some(mut s) = symbol.take() { s.units.push(std::mem::take(&mut unit)); c.symbols.push(s); } continue; }
         if let Some(m) = pin_map_re.captures(line) {
             let pin = m.get(1).or_else(|| m.get(3)).map(|x| x.as_str());
             let pad = m.get(2).or_else(|| m.get(4)).map(|x| x.as_str());
@@ -126,7 +155,8 @@ pub fn canonicalize(
             package = Some(Package {
                 name: m[1].into(),
                 ..Default::default()
-            })
+            });
+            section = Section::Pattern;
         }
         if let Some(m) = sym.captures(line) {
             if let Some(s) = symbol.take() {
@@ -135,7 +165,9 @@ pub fn canonicalize(
             symbol = Some(Symbol {
                 name: m[1].into(),
                 ..Default::default()
-            })
+            });
+            unit = SymbolUnit { name: "unit-1".into(), ..Default::default() };
+            section = Section::Symbol;
         }
         if let Some(m) = pad.captures(line) {
             if let Some(p) = package.as_mut() {
@@ -163,21 +195,28 @@ pub fn canonicalize(
                 })
             }
         }
-        if let Some(m) = line_re.captures(line) {
-            if let Some(p) = package.as_mut() {
-                p.graphics.push(Graphic::Line {
+        if section == Section::Pattern {
+            if let Some(m) = line_re.captures(line) {
+                add_graphic(&mut c, &mut package, Graphic::Line {
                     start: Point {
-                        x_nm: mil_nm(&m[1]),
-                        y_nm: mil_nm(&m[2]),
+                        x_nm: mil_nm(&m[2]), y_nm: mil_nm(&m[3]),
                     },
                     end: Point {
-                        x_nm: mil_nm(&m[3]),
-                        y_nm: mil_nm(&m[4]),
+                        x_nm: mil_nm(&m[4]), y_nm: mil_nm(&m[5]),
                     },
-                    width_nm: 0,
-                    layer: "unknown".into(),
-                });
+                    width_nm: m.get(6).map_or(0, |x| mil_nm(x.as_str())), layer: normalize_layer(&m[1]),
+                }, false);
             }
+            if let Some(m) = arc_re.captures(line) {
+                let cx=mil_nm(&m[2]); let cy=mil_nm(&m[3]); let r=mil_nm(&m[4]); let start: f64=m.get(5).map_or(0.0,|x|x.as_str().parse().unwrap_or(0.0)); let sweep=m[6].parse::<f64>().unwrap_or(0.0); let a=start.to_radians(); let z=(start+sweep).to_radians();
+                let g = if sweep.abs() >= 359.999 { Graphic::Circle { center:Point{x_nm:cx,y_nm:cy}, radius_nm:r, width_nm:m.get(7).map_or(0,|x|mil_nm(x.as_str())), layer:normalize_layer(&m[1]) } } else { Graphic::Arc { center:Point{x_nm:cx,y_nm:cy}, start:Point{x_nm:cx+(r as f64*a.cos()) as i64,y_nm:cy+(r as f64*a.sin()) as i64}, end:Point{x_nm:cx+(r as f64*z.cos()) as i64,y_nm:cy+(r as f64*z.sin()) as i64}, width_nm:m.get(7).map_or(0,|x|mil_nm(x.as_str())), layer:normalize_layer(&m[1]) } };
+                add_graphic(&mut c, &mut package, g, false);
+            }
+            if let Some(m) = text_re.captures(line) { add_graphic(&mut c, &mut package, Graphic::Text { text:m[4].into(), position:Point{x_nm:mil_nm(&m[2]),y_nm:mil_nm(&m[3])}, rotation_mdeg:0, height_nm:0, width_nm:0, layer:normalize_layer(&m[1]) }, false); }
+        } else if section == Section::Symbol {
+            if let Some(m) = symbol_line_re.captures(line) { unit.graphics.push(Graphic::Line { start:Point{x_nm:mil_nm(&m[1]),y_nm:mil_nm(&m[2])}, end:Point{x_nm:mil_nm(&m[3]),y_nm:mil_nm(&m[4])}, width_nm:m.get(5).map_or(0,|x|mil_nm(x.as_str())), layer:"symbol".into() }); }
+            if let Some(m) = arc_re.captures(line) { let cx=mil_nm(&m[2]); let cy=mil_nm(&m[3]); let r=mil_nm(&m[4]); let start: f64=m.get(5).map_or(0.0,|x|x.as_str().parse().unwrap_or(0.0)); let sweep=m[6].parse::<f64>().unwrap_or(0.0); let a=start.to_radians(); let z=(start+sweep).to_radians(); if sweep.abs()>=359.999 { unit.graphics.push(Graphic::Circle {center:Point{x_nm:cx,y_nm:cy},radius_nm:r,width_nm:m.get(7).map_or(0,|x|mil_nm(x.as_str())),layer:"symbol".into()}); } else { unit.graphics.push(Graphic::Arc {center:Point{x_nm:cx,y_nm:cy},start:Point{x_nm:cx+(r as f64*a.cos()) as i64,y_nm:cy+(r as f64*a.sin()) as i64},end:Point{x_nm:cx+(r as f64*z.cos()) as i64,y_nm:cy+(r as f64*z.sin()) as i64},width_nm:m.get(7).map_or(0,|x|mil_nm(x.as_str())),layer:"symbol".into()}); } }
+            if let Some(m) = text_re.captures(line) { unit.graphics.push(Graphic::Text {text:m[4].into(),position:Point{x_nm:mil_nm(&m[2]),y_nm:mil_nm(&m[3])},rotation_mdeg:0,height_nm:0,width_nm:0,layer:"symbol".into()}); }
         }
         if let Some(m) = pin.captures(line) {
             let raw = raw_type.captures(line).map(|x| x[1].to_string());
@@ -187,6 +226,9 @@ pub fn canonicalize(
                 if line.to_ascii_lowercase().contains(&f.to_ascii_lowercase()) {
                     flags.push(f.into());
                 }
+            }
+            if line.contains("(IsVisible False)") && !flags.iter().any(|x| x == "Hidden") {
+                flags.push("Hidden".into());
             }
             let electrical_type = raw
                 .as_deref()
@@ -199,12 +241,9 @@ pub fn canonicalize(
                     y_nm: mil_nm(&m[3]),
                 },
                 length_nm: mil_nm(&m[4]),
-                orientation_mdeg: m
-                    .get(5)
-                    .map(|x| x.as_str().parse::<f64>().unwrap_or(0.0) * 1000.0)
-                    .unwrap_or(0.0) as i32,
+                orientation_mdeg: rotate_re.captures(line).and_then(|x| x[1].parse::<f64>().ok()).unwrap_or(0.0) as i32 * 1000,
                 electrical_type,
-                visible: true,
+                visible: !line.contains("(IsVisible False)"),
                 source_semantics: SourcePinSemantics {
                     electrical_type_raw: raw,
                     shape_raw: shape,
@@ -218,12 +257,6 @@ pub fn canonicalize(
             if let Some(mut p) = pending.take() {
                 p.name = m[1].into();
                 unit.pins.push(p)
-            }
-        }
-        if line.contains("EndSymbol") {
-            if let Some(mut s) = symbol.take() {
-                s.units.push(std::mem::take(&mut unit));
-                c.symbols.push(s)
             }
         }
     }
@@ -322,5 +355,27 @@ mod tests {
             .is_some_and(
                 |v| v.contains("PatternName:DIP2") && v.contains("AlternatePattern:DIP2-HAND")
             ));
+    }
+
+    #[test]
+    fn preserves_graphics_by_explicit_section_and_pin_visibility() {
+        let doc = BxlDocument { version: None, records: Vec::new(), raw_text: Some(r#"
+Pattern "PKG"
+  Line (Layer TOP_SILKSCREEN) (Origin -10, -5) (EndPoint 10, -5) (Width 2)
+EndPattern
+Symbol "BODY"
+  Line (Origin -5, -5) (EndPoint 5, -5) (Width 3)
+  Pin (PinNum 1) (Origin 5, 0) (PinLength 2) (Rotate 180) (IsVisible False)
+    PinName "H"
+EndSymbol
+"#.into()) };
+        let c = canonicalize(&doc, "TI", "X", None);
+        assert_eq!(c.packages[0].graphics.len(), 1);
+        assert_eq!(c.packages[0].graphics[0], Graphic::Line { start: Point{x_nm:-254000,y_nm:-127000}, end: Point{x_nm:254000,y_nm:-127000}, width_nm:50800, layer:"TOP_SILKSCREEN".into() });
+        assert_eq!(c.symbols[0].units[0].graphics.len(), 1);
+        assert_eq!(c.symbols[0].units[0].graphics[0], Graphic::Line { start: Point{x_nm:-127000,y_nm:-127000}, end: Point{x_nm:127000,y_nm:-127000}, width_nm:76200, layer:"symbol".into() });
+        assert!(!c.symbols[0].units[0].pins[0].visible);
+        assert!(c.symbols[0].units[0].pins[0].source_semantics.flags.iter().any(|x| x == "Hidden"));
+        assert_eq!(c.symbols[0].units[0].pins[0].orientation_mdeg, 180000);
     }
 }
