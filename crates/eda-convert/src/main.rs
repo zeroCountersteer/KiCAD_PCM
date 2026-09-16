@@ -958,7 +958,12 @@ fn kicad_generate(
     } else if all && manufacturer.as_deref() == Some("ti") {
         let mut expected = current_ti_component_paths(data)?;
         if let Some(wanted) = &wanted {
-            expected.retain(|p| p.file_stem().is_some_and(|s| wanted.contains(s.to_string_lossy().as_ref())));
+            expected.retain(|p| {
+                fs::read_to_string(p)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<EdaComponent>(&text).ok())
+                    .is_some_and(|component| wanted.contains(&component.mpn))
+            });
         }
         let missing = expected
             .iter()
