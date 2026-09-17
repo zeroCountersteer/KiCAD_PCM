@@ -1,4 +1,4 @@
-use eda_model::{EdaComponent, ElectricalType, Graphic, Package, Symbol};
+use eda_model::{EdaComponent, ElectricalType, Graphic, Package, Symbol, SymbolUnit};
 use std::{collections::BTreeSet, fmt::Write};
 pub const KICAD_VERSION: &str = "20231120";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +141,24 @@ pub fn symbol_lib_many_with_policy(
     }
     o.push_str(")\n");
     o
+}
+
+/// Emits one component view without retaining a library-wide component list.
+/// The caller owns the library header/footer and may stream these fragments.
+pub fn symbol_fragment_with_footprints(
+    c: &EdaComponent,
+    nickname: &str,
+    footprints: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    let mut s = c.symbols.first().cloned().unwrap_or_else(|| Symbol {
+        name: c.mpn.clone(),
+        units: vec![SymbolUnit { name: "1".into(), ..Default::default() }],
+        ..Default::default()
+    });
+    s.name = c.mpn.clone();
+    out.push_str(&symbol(c, &s, nickname, footprints, SymbolRendering::GeneratedBox));
+    out
 }
 pub fn sexpr_balanced(s: &str) -> bool {
     let mut depth = 0i32;
@@ -412,7 +430,9 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         } else {
             "smd"
         };
-        let paste_split = kind == "smd" && x.paste_size.as_ref().is_some_and(|size| size != &x.size);
+        let paste_split = kind == "smd" && x.paste_size.as_ref().is_some_and(|size| {
+            size.x_nm > 0 && size.y_nm > 0 && size != &x.size
+        });
         let default_layers = if kind == "smd" {
             if paste_split { "\"F.Cu\" \"F.Mask\"" } else { "\"F.Cu\" \"F.Paste\" \"F.Mask\"" }
         } else {
@@ -447,7 +467,7 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
         }).unwrap_or_default();
         let _ = writeln!(
             o,
-            "  (pad \"{}\" {} {} (at {} {} {}) (size {} {}) (layers {}){})",
+            "  (pad \"{}\" {} {} (at {} {} {}) (size {} {}) (layers {}){}{})",
             esc(&x.number),
             kind,
             shape,
@@ -457,15 +477,9 @@ pub fn footprint_with_model(_c: &EdaComponent, p: &Package, model: Option<&str>)
             mm(x.size.x_nm),
             mm(x.size.y_nm),
             layers,
-            drill
+            drill,
+            mask_margin
         );
-        if !mask_margin.is_empty() {
-            let needle = format!("(pad \"{}\"", esc(&x.number));
-            if let Some(pos) = o.rfind(&needle) {
-                let insert = pos + o[pos..].find('\n').unwrap_or(0);
-                o.insert_str(insert, &mask_margin);
-            }
-        }
         if paste_split {
             let size = x.paste_size.as_ref().unwrap();
             let _ = writeln!(o, "  (pad \"\" smd {} (at {} {} {}) (size {} {}) (layers \"F.Paste\"){})",
