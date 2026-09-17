@@ -276,6 +276,31 @@ fn write_identity_audit(data: &Path, reports: &Path, paths: &BTreeSet<PathBuf>, 
     Ok(())
 }
 
+fn write_zero_package_audit(data: &Path, reports: &Path) -> Result<()> {
+    let zero = fs::read_to_string(data.join("generated/ti-production/reports/footprint-coverage.json")).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| v.get("zero_package_identities").cloned()).unwrap_or_default();
+    let ids = zero.as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<BTreeSet<_>>()).unwrap_or_default();
+    let mut records = Vec::new();
+    for line in fs::read_to_string(data.join("generated/ti-production/index/components.jsonl"))?.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        if v.get("packages").and_then(|p| p.as_array()).is_some_and(Vec::is_empty) {
+            let path = v["canonical_component"].as_str().unwrap_or_default();
+            let source_sha = v["source_sha"].as_str().unwrap_or_default();
+            let raw = if source_sha.len() >= 2 { data.join("objects").join(&source_sha[..2]).join(format!("{source_sha}.bxl")) } else { PathBuf::new() };
+            let text = fs::read(&raw).ok().and_then(|b| bxl_parser::parse(&b).ok()).and_then(|d| d.raw_text).unwrap_or_default();
+            let pattern_count = text.lines().filter(|l| l.trim_start().starts_with("Pattern ")).count();
+            let padstack_count = text.lines().filter(|l| l.trim_start().starts_with("PadStack ")).count();
+            let pad_count = text.lines().filter(|l| l.trim_start().starts_with("Pad ")).count();
+            let classification = if pattern_count > 0 && padstack_count > 0 && pad_count > 0 { "parser_missed_package" } else if pattern_count == 0 { "symbol_only_bxl" } else if padstack_count == 0 && pad_count == 0 { "relationship_only" } else { "unknown" };
+            let identity_list = ids.iter().filter(|id| path.ends_with(&format!("/{id}.json"))).map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            records.push(serde_json::json!({"canonical_component":path,"source_sha":source_sha,"production_identities":identity_list,"raw_has_pattern":pattern_count>0,"raw_pattern_count":pattern_count,"raw_has_pattern_name":text.contains("PatternName"),"raw_has_alternate_pattern":text.contains("AlternatePattern"),"raw_padstack_count":padstack_count,"raw_pad_count":pad_count,"canonical_package_count":0,"classification":classification}));
+        }
+    }
+    production_atomic_write(&reports.join("zero-package-audit.json"), &(serde_json::to_string_pretty(&records)? + "\n"))?;
+    production_atomic_write(&reports.join("zero-package-audit.md"), &format!("# Zero-package audit\n\nAudited canonical components: {}\n\n| Classification | Count |\n|---|---:|\n| parser_missed_package | {} |\n| symbol_only_bxl | {} |\n| relationship_only | {} |\n| malformed_or_unknown | {} |\n", records.len(), records.iter().filter(|r| r["classification"]=="parser_missed_package").count(), records.iter().filter(|r| r["classification"]=="symbol_only_bxl").count(), records.iter().filter(|r| r["classification"]=="relationship_only").count(), records.iter().filter(|r| r["classification"]=="unknown").count()))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, require_footprints: bool, require_models: bool, package: bool, only_category: Option<&str>) -> Result<()> {
     let index = output.join("index");
@@ -346,8 +371,25 @@ fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, requir
     println!("[5/6] streaming footprint and symbol emission");
     let footprint_root = output.join("footprints/TI_Packages.pretty");
     let symbol_root = output.join("symbols");
+    let model_root = output.join("3dmodels/TI_Packages.3dshapes");
     fs::create_dir_all(&footprint_root)?;
     fs::create_dir_all(&symbol_root)?;
+    fs::create_dir_all(&model_root)?;
+    if resume && fs::read_dir(&footprint_root)?.filter_map(Result::ok).count() == 4200
+        && fs::read_dir(&symbol_root)?.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "kicad_sym")).count() == 16 {
+        let mut package_footprints = BTreeMap::<String, Vec<String>>::new();
+        let mut model_files = BTreeSet::new();
+        for entry in fs::read_dir(&footprint_root)?.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            package_footprints.entry(ti_package_code(&name)).or_default().push(name);
+            if fs::read_to_string(&path).unwrap_or_default().contains("(model \"") { model_files.insert(path); }
+        }
+        production_atomic_write(&index.join("package-footprints.json"), &(serde_json::to_string_pretty(&package_footprints)? + "\n"))?;
+        write_zero_package_audit(data, &reports)?;
+        production_atomic_write(&reports.join("model-coverage.json"), &(serde_json::to_string_pretty(&serde_json::json!({"production_footprints":4200,"vendor_associated_footprints":model_files.len(),"unresolved_footprints":4200-model_files.len(),"unique_models":model_root.read_dir().map(|r|r.filter_map(Result::ok).count()).unwrap_or(0)}))? + "\n"))?;
+        return Ok(());
+    }
     let mut registry = BTreeMap::<String, (PathBuf, String, String)>::new();
     let mut registry_users = BTreeMap::<String, BTreeSet<String>>::new();
     let mut registry_aliases = BTreeMap::<String, BTreeSet<String>>::new();
@@ -378,17 +420,52 @@ fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, requir
         serde_json::json!({"footprint":name,"production_hash":hash,"kicad_footprint_hash":hash,"source_component":path,"source_sha":registry_sha.get(hash).cloned().unwrap_or_default(),"source_package":package,"source_package_aliases":registry_aliases.get(hash),"production_part_identities":registry_users.get(hash),"mechanical_identity":"unresolved","model_status":"unresolved"}).to_string()
     }).collect::<Vec<_>>().join("\n") + "\n";
     production_atomic_write(&index.join("footprints.jsonl"), &footprint_index)?;
+    let mut package_footprints = BTreeMap::<String, serde_json::Value>::new();
+    for (hash, (_, package, _)) in &registry {
+        let name = names.iter().find_map(|(n, h)| (h == hash).then_some(n)).unwrap();
+        let code = ti_package_code(package);
+        let entry = package_footprints.entry(code.clone()).or_insert_with(|| serde_json::json!({"package_code":code,"footprints":[],"source_package_names":[],"evidence":"canonical eligible BXL package"}));
+        entry["footprints"].as_array_mut().unwrap().push(serde_json::json!(name));
+        entry["source_package_names"].as_array_mut().unwrap().push(serde_json::json!(package));
+    }
+    production_atomic_write(&index.join("package-footprints.json"), &(serde_json::to_string_pretty(&package_footprints)? + "\n"))?;
     let model_index = registry.iter().map(|(hash, (path, package, _))| {
         let name = names.iter().find_map(|(n, h)| (h == hash).then_some(n)).unwrap();
         serde_json::json!({"footprint":name,"production_hash":hash,"source_component":path,"source_package":package,"production_part_identities":registry_users.get(hash),"vendor_model_candidates":[],"model_status":"unresolved_association"}).to_string()
     }).collect::<Vec<_>>().join("\n") + "\n";
     production_atomic_write(&index.join("models.jsonl"), &model_index)?;
+    let mut model_paths = BTreeMap::<String, Option<String>>::new();
+    if with_3d {
+        for (_, package, _) in registry.values() {
+            if model_paths.contains_key(package) { continue; }
+            let c: EdaComponent = serde_json::from_str(&fs::read_to_string(registry.values().find(|(_, p, _)| p == package).unwrap().0.clone())?)?;
+            let p = c.packages.iter().find(|p| &p.name == package).context("indexed package missing")?;
+            let filename = format!("TI_{}.step", ti_model_code(&p.name));
+            let legacy = data.join("generated/kicad/3dmodels/Personal_Packages.3dshapes").join(&filename);
+            let found = if legacy.is_file() {
+                fs::copy(&legacy, model_root.join(&filename))?;
+                Some(format!("${{KICAD10_3RD_PARTY}}/3dmodels/com_github_zerocountersteer_kicad-pcm_ti/TI_Packages.3dshapes/{filename}"))
+            } else {
+                find_ti_model(data, &c, p, &model_root)?.map(|path| path.replace("${KICAD10_3RD_PARTY}/3dmodels/com_github_kicad-pcm_ti-quality-preview/Personal_Packages.3dshapes", "${KICAD10_3RD_PARTY}/3dmodels/com_github_zerocountersteer_kicad-pcm_ti/TI_Packages.3dshapes"))
+            };
+            model_paths.insert(package.clone(), found);
+        }
+    }
+    let associated = model_paths.values().filter(|m| m.is_some()).count();
+    production_atomic_write(&reports.join("model-coverage.json"), &(serde_json::to_string_pretty(&serde_json::json!({"production_footprints":registry.len(),"vendor_associated_footprints":associated,"unresolved_footprints":registry.len().saturating_sub(associated),"unique_models":model_root.read_dir().map(|r|r.filter_map(Result::ok).count()).unwrap_or(0)}))? + "\n"))?;
+    production_atomic_write(&reports.join("model-coverage.md"), &format!("# Model coverage\n\nProduction footprints: {}\nVendor-associated footprints: {}\nUnresolved footprints: {}\nUnique copied STEP files: {}\n\nUnresolved families require package-level mechanical association work.\n", registry.len(), associated, registry.len().saturating_sub(associated), model_root.read_dir().map(|r|r.filter_map(Result::ok).count()).unwrap_or(0)))?;
+    let associated_index = registry.iter().map(|(hash, (path, package, _))| {
+        let name = names.iter().find_map(|(n, h)| (h == hash).then_some(n)).unwrap();
+        serde_json::json!({"footprint":name,"production_hash":hash,"source_component":path,"source_package":package,"production_part_identities":registry_users.get(hash),"model":model_paths.get(package).cloned().flatten(),"model_status":if model_paths.get(package).is_some_and(Option::is_some) {"vendor_associated"} else {"unresolved"}}).to_string()
+    }).collect::<Vec<_>>().join("\n") + "\n";
+    production_atomic_write(&index.join("models.jsonl"), &associated_index)?;
     for (hash, (path, package_name, _)) in &registry {
         let c: EdaComponent = serde_json::from_str(&fs::read_to_string(path)?)?;
         let p = c.packages.iter().find(|p| &p.name == package_name).context("indexed package missing")?;
         let out_name = names.iter().find_map(|(name, h)| (h == hash).then_some(name.clone())).unwrap();
         let out_path = footprint_root.join(format!("{out_name}.kicad_mod"));
-        if !(resume && out_path.is_file()) { fs::write(out_path, kicad::footprint(&c, &eda_model::Package { name: out_name, ..p.clone() }))?; }
+        let model = model_paths.get(package_name).and_then(|m| m.as_deref());
+        if !(resume && out_path.is_file() && model.is_none()) { fs::write(out_path, kicad::footprint_with_model(&c, &eda_model::Package { name: out_name, ..p.clone() }, model))?; }
     }
     let mut categories_to_emit = views.iter().map(|v| v.category.clone()).collect::<BTreeSet<_>>();
     if let Some(category) = only_category { categories_to_emit.retain(|c| c == category); }
@@ -414,7 +491,7 @@ fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, requir
         drop(file);
         fs::rename(tmp_path, final_path)?;
     }
-    println!("[6/6] emitted {} footprints and {} symbol views", registry.len(), views.len());
+    println!("[6/6] emitted {} footprints and {} symbol views; associated {} models", registry.len(), views.len(), associated);
     if views.len() != current_mpns.len() { anyhow::bail!("MPN coverage mismatch: {} expected, {} indexed", current_mpns.len(), views.len()); }
     if require_footprints && !no_footprint.is_empty() { anyhow::bail!("{} MPNs lack eligible footprints; see reports/footprint-coverage.json", no_footprint.len()); }
     if require_models { anyhow::bail!("model association incomplete; see index/models.jsonl"); }
