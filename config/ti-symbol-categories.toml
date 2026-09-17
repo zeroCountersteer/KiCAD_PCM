@@ -1,0 +1,18 @@
+# Raw TI taxonomy -> stable generated KiCad library name.
+# Until structured category observations are acquired, unknowns route to TI_Misc.
+"Amplifiers" = "TI_Amplifiers"
+"Audio" = "TI_Audio"
+"Clocks & Timing" = "TI_Clocks_Timing"
+"Data Converters" = "TI_Data_Converters"
+"Interface" = "TI_Interface"
+"Isolation" = "TI_Isolation"
+"Logic" = "TI_Logic"
+"Microcontrollers" = "TI_Microcontrollers"
+"Motor Drivers" = "TI_Motor_Drivers"
+"Power Management" = "TI_Power_Management"
+"Processors" = "TI_Processors"
+"RF & Microwave" = "TI_RF_Microwave"
+"Sensors" = "TI_Sensors"
+"Switches & Multiplexers" = "TI_Switches_Multiplexers"
+"Wireless Connectivity" = "TI_Wireless_Connectivity"
+"Transistors & Discretes" = "TI_Discretes"

@@ -1,0 +1,8 @@
+manufacturer = "Texas Instruments"
+pcm_name = "KiCAD_PCM Texas Instruments"
+pcm_identifier = "com.github.zerocountersteer.kicad-pcm.ti"
+pcm_version = "0.1.0"
+footprint_directory = "TI_Packages.pretty"
+footprint_nickname = "PCM_TI_Packages"
+model_directory = "TI_Packages.3dshapes"
+symbol_prefix = "TI_"

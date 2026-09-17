@@ -99,6 +99,15 @@ enum Command {
         #[arg(long)] reference_root: PathBuf,
         #[arg(long)] json: bool,
     },
+    TiProduction {
+        #[arg(long, default_value = "data/generated/ti-production")]
+        output: PathBuf,
+        #[arg(long)] resume: bool,
+        #[arg(long)] with_3d: bool,
+        #[arg(long)] require_footprints: bool,
+        #[arg(long)] require_models: bool,
+        #[arg(long)] package: bool,
+    },
 }
 fn main() -> Result<()> {
     let c = Cli::parse();
@@ -161,7 +170,101 @@ fn main() -> Result<()> {
         Command::KicadCheck { path } => kicad_check(&path),
         Command::KicadReferenceCheck { mpn, mpn_file, reference_root, json } =>
             kicad_reference_check(&c.data, mpn.as_deref(), mpn_file.as_deref(), &reference_root, json),
+        Command::TiProduction { output, resume, with_3d, require_footprints, require_models, package } =>
+            ti_production(&c.data, &output, resume, with_3d, require_footprints, require_models, package),
     }
+}
+
+#[derive(serde::Serialize)]
+struct ProductionMpnView {
+    mpn: String,
+    canonical_component: String,
+    source_sha: String,
+    category: String,
+    symbol_library: String,
+    compatible_packages: Vec<String>,
+    default_package: Option<String>,
+}
+
+fn production_atomic_write(path: &Path, text: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn current_ti_mpns(data: &Path) -> Result<BTreeSet<String>> {
+    let rows: Vec<vendor_ti::TiPackageProduct> = serde_json::from_str(
+        &fs::read_to_string(data.join("catalogs/ti-bxl/current.json"))?,
+    )?;
+    Ok(rows.into_iter()
+        .filter(|r| r.bxl_url.as_deref().is_some_and(|u| vendor_ti::classify_cad_url(u) == vendor_ti::CadAssetKind::Bxl))
+        .map(|r| r.part_number)
+        .collect())
+}
+
+fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, require_footprints: bool, require_models: bool, package: bool) -> Result<()> {
+    let index = output.join("index");
+    let reports = output.join("reports");
+    let cache = output.join("cache");
+    for dir in [output, &index, &reports, &cache] { fs::create_dir_all(dir)?; }
+    println!("[1/6] current corpus");
+    let corpus = load_current_ti_bxl_corpus(data)?;
+    let current_mpns = current_ti_mpns(data)?;
+    let paths = conversion_plans(data, &corpus).into_iter().map(|p| p.output).collect::<BTreeSet<_>>();
+    let sha_count = corpus.assets.iter().map(|a| a.sha256.as_str()).collect::<BTreeSet<_>>().len();
+    let fingerprint = format!("{}:{}:{}", bxl_parser::BXL_CANONICALIZER_VERSION, corpus.unique_urls, sha_count);
+    let reused = resume && fs::read_to_string(cache.join("corpus-index.json")).ok().is_some_and(|s| s.contains(&fingerprint));
+    production_atomic_write(&cache.join("corpus-index.json"), &format!("{{\"fingerprint\":\"{fingerprint}\",\"reused\":{reused}}}\n"))?;
+    println!("[2/6] MPN views ({})", current_mpns.len());
+    let mut views = Vec::new();
+    let mut component_lines = Vec::new();
+    let mut source_packages = 0usize;
+    let mut eligible_packages = 0usize;
+    let mut no_footprint = BTreeSet::new();
+    let mut shapes = BTreeMap::<String, usize>::new();
+    for path in &paths {
+        let c: EdaComponent = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let eligible = c.packages.iter().filter(|p| matches!(eda_model::footprint_eligibility(p), eda_model::FootprintEligibility::Eligible)).map(|p| safe(&p.name)).collect::<Vec<_>>();
+        source_packages += c.packages.len(); eligible_packages += eligible.len();
+        for p in &c.packages { for shape in p.pads.iter().map(|p| p.shape.to_ascii_lowercase()).collect::<BTreeSet<_>>() { *shapes.entry(shape).or_default() += 1; } }
+        let mut names = vec![c.mpn.clone()];
+        if let Some(a) = c.metadata.get("associated_mpns") { names.extend(a.split(';').map(str::to_owned)); }
+        names.retain(|m| current_mpns.contains(m)); names.sort(); names.dedup();
+        if eligible.is_empty() { no_footprint.extend(names.iter().cloned()); }
+        for mpn in names {
+            views.push(ProductionMpnView { mpn, canonical_component: path.display().to_string(), source_sha: c.source_sha256.clone().unwrap_or_default(), category: "TI_Misc".into(), symbol_library: "TI_Misc.kicad_sym".into(), default_package: (eligible.len() == 1).then(|| eligible[0].clone()), compatible_packages: eligible.clone() });
+        }
+        component_lines.push(serde_json::json!({"canonical_component":path.display().to_string(),"source_sha":c.source_sha256,"mpn":c.mpn,"associated_mpns":c.metadata.get("associated_mpns"),"packages":c.packages.iter().map(|p|serde_json::json!({"name":p.name,"eligible":matches!(eda_model::footprint_eligibility(p), eda_model::FootprintEligibility::Eligible),"pad_count":p.pads.len()})).collect::<Vec<_>>()}).to_string());
+    }
+    views.sort_by(|a,b| a.mpn.cmp(&b.mpn));
+    views.dedup_by(|a,b| a.mpn == b.mpn);
+    production_atomic_write(&index.join("mpns.jsonl"), &(views.iter().map(|v|serde_json::to_string(v).unwrap()).collect::<Vec<_>>().join("\n") + "\n"))?;
+    production_atomic_write(&index.join("components.jsonl"), &(component_lines.join("\n") + "\n"))?;
+    println!("[3/6] categories");
+    production_atomic_write(&reports.join("category-source-audit.md"), &format!("# Category source audit\n\nLocal authoritative category field: absent from current BXL catalog.\n\nCoverage: 0 / {}.\n\nFallback: all MPNs routed deterministically to `TI_Misc`.\n", current_mpns.len()))?;
+    production_atomic_write(&reports.join("category-counts.json"), &(serde_json::to_string_pretty(&serde_json::json!({"TI_Misc":views.len()}))? + "\n"))?;
+    println!("[4/6] footprint/model coverage");
+    let manifests = fs::read_to_string(data.join("manifests/texas-instruments.jsonl")).unwrap_or_default().lines().filter_map(|l|serde_json::from_str::<ManifestRecord>(l).ok()).collect::<Vec<_>>();
+    let steps = manifests.iter().filter(|m|m.format == "step" || m.format == "stp").collect::<Vec<_>>();
+    let present = steps.iter().filter(|m|data.join("objects").join(&m.sha256[..2]).join(format!("{}.{}",m.sha256,m.format)).is_file()).count();
+    production_atomic_write(&reports.join("pad-shapes.json"), &(serde_json::to_string_pretty(&shapes)? + "\n"))?;
+    production_atomic_write(&reports.join("footprint-coverage.json"), &(serde_json::to_string_pretty(&serde_json::json!({"current_mpns":current_mpns.len(),"mpns_with_eligible_footprint":views.iter().filter(|v|!v.compatible_packages.is_empty()).count(),"mpns_without_eligible_footprint":no_footprint,"source_packages":source_packages,"eligible_packages":eligible_packages}))? + "\n"))?;
+    production_atomic_write(&reports.join("footprint-coverage.md"), &format!("# Footprint coverage\n\nCurrent MPNs: {}\nMPNs with an eligible production footprint: {}\nMPNs without an eligible production footprint: {}\nSource packages: {}\nEligible packages: {}\n\nThe complete blocker set is in `footprint-coverage.json`.\n", current_mpns.len(), views.iter().filter(|v| !v.compatible_packages.is_empty()).count(), no_footprint.len(), source_packages, eligible_packages))?;
+    let model_lines = steps.iter().map(|m|serde_json::json!({"sha256":m.sha256,"filename":m.filename,"format":m.format,"present":data.join("objects").join(&m.sha256[..2]).join(format!("{}.{}",m.sha256,m.format)).is_file()}).to_string()).collect::<Vec<_>>();
+    production_atomic_write(&index.join("models.jsonl"), &(model_lines.join("\n") + "\n"))?;
+    production_atomic_write(&reports.join("model-families.md"), &format!("# TI model inventory\n\nSTEP manifest assets: {}\nSTEP objects present: {}\n\nFull association/generation remains a separate production stage.\n", steps.len(), present))?;
+    production_atomic_write(&reports.join("model-families.json"), &(serde_json::to_string_pretty(&serde_json::json!({"manifest_assets":steps.len(),"objects_present":present,"unresolved_association_stage":true}))? + "\n"))?;
+    let summary = serde_json::json!({"current_bxl_observations":corpus.observations,"current_bxl_urls":corpus.unique_urls,"current_bxl_shas":sha_count,"current_mpns":current_mpns.len(),"production_mpn_views":views.len(),"categories":{"TI_Misc":views.len()},"source_packages":source_packages,"eligible_packages":eligible_packages,"mpns_without_footprint":no_footprint.len(),"step_manifest_assets":steps.len(),"step_objects_present":present,"with_3d":with_3d,"package_requested":package,"resume_reused":reused});
+    production_atomic_write(&reports.join("ti-production-summary.json"), &(serde_json::to_string_pretty(&summary)? + "\n"))?;
+    production_atomic_write(&reports.join("TI-PRODUCTION-SUMMARY.md"), &format!("# TI production summary\n\nCurrent MPNs: {}\nIndexed MPN views: {}\nCategories: TI_Misc ({})\nSource packages: {}\nEligible packages: {}\nMPNs without eligible footprint: {}\nSTEP manifest assets: {}\nSTEP objects present: {}\n\nThis bounded indexing pass writes complete coverage reports. Symbol/footprint emission, category acquisition, and model association remain gated stages.\n",current_mpns.len(),views.len(),views.len(),source_packages,eligible_packages,no_footprint.len(),steps.len(),present))?;
+    println!("[5/6] reports complete");
+    if views.len() != current_mpns.len() { anyhow::bail!("MPN coverage mismatch: {} expected, {} indexed", current_mpns.len(), views.len()); }
+    if require_footprints && !no_footprint.is_empty() { anyhow::bail!("{} MPNs lack eligible footprints; see reports/footprint-coverage.json", no_footprint.len()); }
+    if require_models { anyhow::bail!("model association incomplete; see index/models.jsonl"); }
+    if package { anyhow::bail!("PCM packaging is gated until production symbol, footprint, and model emission stages complete"); }
+    println!("[6/6] planning pass complete; PCM not produced");
+    Ok(())
 }
 
 fn kicad_reference_check(data: &Path, single: Option<&str>, file: Option<&Path>, reference_root: &Path, json: bool) -> Result<()> {
