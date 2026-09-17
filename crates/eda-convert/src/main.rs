@@ -348,25 +348,23 @@ fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, requir
     let symbol_root = output.join("symbols");
     fs::create_dir_all(&footprint_root)?;
     fs::create_dir_all(&symbol_root)?;
-    if resume && fs::read_dir(&footprint_root)?.filter_map(Result::ok).count() == 4200
-        && fs::read_dir(&symbol_root)?.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "kicad_sym")).count() == 16 {
-        let records = fs::read_dir(&footprint_root)?.filter_map(Result::ok).filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned())).map(|name| serde_json::json!({"footprint":name,"model_status":"unresolved_association"}).to_string()).collect::<Vec<_>>().join("\n") + "\n";
-        production_atomic_write(&index.join("footprints.jsonl"), &records)?;
-        production_atomic_write(&index.join("models.jsonl"), &records)?;
-        println!("[6/6] reused 4200 footprints and 16 category symbol libraries");
-        if require_footprints && !no_footprint.is_empty() { anyhow::bail!("{} MPNs lack eligible footprints; see reports/footprint-coverage.json", no_footprint.len()); }
-        if require_models { anyhow::bail!("model association incomplete; see index/models.jsonl"); }
-        if package { anyhow::bail!("PCM packaging remains gated until model coverage is complete"); }
-        return Ok(());
-    }
     let mut registry = BTreeMap::<String, (PathBuf, String, String)>::new();
+    let mut registry_users = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut registry_aliases = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut registry_sha = BTreeMap::<String, String>::new();
     for path in &paths {
         let c: EdaComponent = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let mut identities = vec![c.mpn.clone()];
+        if let Some(a) = c.metadata.get("associated_mpns") { identities.extend(a.split(';').map(str::to_owned)); }
+        identities.retain(|m| current_mpns.contains(m));
         for p in &c.packages {
             if !matches!(eda_model::footprint_eligibility(p), eda_model::FootprintEligibility::Eligible) { continue; }
             let n = package_normalize::normalize_package(&c, p);
             let hash = n.fingerprints.kicad_footprint_hash.clone().unwrap_or(n.fingerprints.full_geometry_hash.clone());
             registry.entry(hash.clone()).or_insert_with(|| (path.clone(), p.name.clone(), safe(&p.name)));
+            registry_users.entry(hash.clone()).or_default().extend(identities.iter().cloned());
+            registry_aliases.entry(hash.clone()).or_default().insert(p.name.clone());
+            registry_sha.entry(hash).or_insert_with(|| c.source_sha256.clone().unwrap_or_default());
         }
     }
     let mut names = BTreeMap::<String, String>::new();
@@ -377,12 +375,12 @@ fn ti_production(data: &Path, output: &Path, resume: bool, with_3d: bool, requir
     }
     let footprint_index = registry.iter().map(|(hash, (path, package, _))| {
         let name = names.iter().find_map(|(n, h)| (h == hash).then_some(n)).unwrap();
-        serde_json::json!({"footprint":name,"kicad_footprint_hash":hash,"source_component":path,"source_package":package,"mechanical_identity":"unresolved","model_status":"unresolved"}).to_string()
+        serde_json::json!({"footprint":name,"production_hash":hash,"kicad_footprint_hash":hash,"source_component":path,"source_sha":registry_sha.get(hash).cloned().unwrap_or_default(),"source_package":package,"source_package_aliases":registry_aliases.get(hash),"production_part_identities":registry_users.get(hash),"mechanical_identity":"unresolved","model_status":"unresolved"}).to_string()
     }).collect::<Vec<_>>().join("\n") + "\n";
     production_atomic_write(&index.join("footprints.jsonl"), &footprint_index)?;
     let model_index = registry.iter().map(|(hash, (path, package, _))| {
         let name = names.iter().find_map(|(n, h)| (h == hash).then_some(n)).unwrap();
-        serde_json::json!({"footprint":name,"kicad_footprint_hash":hash,"source_component":path,"source_package":package,"vendor_model_candidates":[],"model_status":"unresolved_association"}).to_string()
+        serde_json::json!({"footprint":name,"production_hash":hash,"source_component":path,"source_package":package,"production_part_identities":registry_users.get(hash),"vendor_model_candidates":[],"model_status":"unresolved_association"}).to_string()
     }).collect::<Vec<_>>().join("\n") + "\n";
     production_atomic_write(&index.join("models.jsonl"), &model_index)?;
     for (hash, (path, package_name, _)) in &registry {
